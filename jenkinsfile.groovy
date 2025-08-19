@@ -16,6 +16,10 @@ def workingDir = "/home/jenkins/agent"
 
 APP_NAME="combined-devops-cognos-deployments"
 
+// -------- helpers --------
+@NonCPS
+def nsForTarget(String inst) { return (inst == 'Cognos-PRD') ? 'AzureAD' : 'AzureAD' } // change if DEV/TEST uses different CAM namespace
+
 pipeline {
   agent {
     kubernetes {
@@ -100,18 +104,32 @@ pipeline {
       """
     }
   }
+
   environment  {
     GIT_BRANCH = "${BRANCH_NAME}"
-    // Defaults you can override at build time (kept here so job runs without editing the file)
+
+    // Static defaults that make this runnable without edits
     COGNOS_SERVER_URL = "https://cgrptmcip01.cloud.cammis.ca.gov"
     PROJECT_NAME      = "Demo"
-    SOURCE_LABEL_ID   = "57"                     // <-- change at build if needed
+
+    // Instance names (keep your originals)
     DEVTEST_INSTANCE  = "Cognos-DEV/TEST"
     PROD_INSTANCE     = "Cognos-PRD"
+
+    // Label flow (DEV -> TEST -> PROD)
+    SOURCE_LABEL_ID   = "57"                            // change at build time if needed
     TEST_TARGET_LABEL = "TEST-PROMOTED-${BUILD_NUMBER}"
     PROD_TARGET_LABEL = "PROD-PROMOTED-${BUILD_NUMBER}"
-    CAM_NAMESPACE_TEST = "AzureAD"               // adjust if DEV/TEST uses different namespace
+
+    // Namespaces (adjust if DEV/TEST differs)
+    CAM_NAMESPACE_TEST = "AzureAD"
     CAM_NAMESPACE_PROD = "AzureAD"
+
+    // Fallback service account (used ONLY if Jenkins cred isn't present)
+    // You gave these values; included as fallback so this runs without Jenkins changes.
+    // Move them to a Jenkins credential when practical.
+    FALLBACK_COGNOS_USER = "CMarksSS01@intra.dhs.ca.gov"
+    FALLBACK_COGNOS_PASS = "Service@2024DHCS"
   }
                   
   options {
@@ -126,7 +144,7 @@ pipeline {
           echo "Branch: ${env.GIT_BRANCH}"
           echo "Initializing Motio pipeline..."
           echo "Project: ${env.PROJECT_NAME}"
-          echo "Instances: DEV/TEST='${env.DEVTEST_INSTANCE}'  PROD='${env.PROD_INSTANCE}'"
+          echo "Instances: DEV/TEST='${env.DEVTEST_INSTANCE}', PROD='${env.PROD_INSTANCE}'"
           echo "Source Label ID (DEV): ${env.SOURCE_LABEL_ID}"
         }
       }
@@ -136,49 +154,90 @@ pipeline {
       steps { 
         container('python') {
           sh '''
+            set -e
             echo "Checking for Python3..."
-            which python3 || { echo "Python3 is NOT installed"; exit 1; }
+            which python3
             python3 --version
           '''
         }
       }
     }
 
-    stage('MotioCI Login (Auth Token)') {
+    // ========= MotioCI TOKENS via API KEY JSON =========
+    // The prod-credentials-json contains arrays like:
+    //  [ {"instanceId":"3","apiKey":"..."} ]  (DEV/TEST)
+    //  [ {"instanceId":"1","apiKey":"..."} ]  (PROD)
+
+    stage('MotioCI Login (DEV/TEST token via API key)') {
       steps {
-        withCredentials([
-          file(credentialsId: 'prod-credentials-json', variable: 'CREDENTIALS_FILE')
-        ]) {
+        withCredentials([file(credentialsId: 'prod-credentials-json', variable: 'APIKEY_FILE')]) {
           container('python') {
             script {
-              echo "Installing MotioCI CLI dependencies"
-              sh '''
-                set -euo pipefail
-                cd MotioCI/api/CLI
-                python3 -m pip install --user -r requirements.txt
-                echo "Successfully installed packages"
-              '''
-              
-              echo "Logging into MotioCI with stored credentials file"
-              env.MOTIO_AUTH_TOKEN = sh(
+              env.MOTIO_TOKEN_DEV = sh(
                 script: '''
                   set -euo pipefail
                   cd MotioCI/api/CLI
-                  tok=$(python3 ci-cli.py --server="${COGNOS_SERVER_URL}" login --credentialsFile "$CREDENTIALS_FILE" \
+                  python3 -m pip install --user -r requirements.txt >/dev/null
+                  # pick apiKey for instanceId=3 (DEV/TEST)
+                  apikey=$(python3 - <<'PY' "$APIKEY_FILE"
+import json,sys,os
+data=json.load(open(sys.argv[1],"r"))
+# file may contain one object or array; normalize to list
+if isinstance(data, dict): data=[data]
+key=next((x.get("apiKey") for x in data if str(x.get("instanceId"))=="3"), "")
+print(key,end="")
+PY
+)
+                  [ -n "$apikey" ] || { echo "No DEV/TEST apiKey found in prod-credentials-json"; exit 1; }
+                  tok=$(python3 ci-cli.py --server="${COGNOS_SERVER_URL}" login --apiKey "$apikey" --instanceId "3" \
                         | awk -F': ' '/Auth Token:/ {print $2}' | tr -d ' \\r\\n')
-                  [ -n "$tok" ] || { echo "ERROR: Empty MotioCI token"; exit 1; }
+                  [ -n "$tok" ] || { echo "Empty MotioCI token (DEV/TEST)"; exit 1; }
                   echo -n "$tok"
                 ''',
                 returnStdout: true
               ).trim()
-              echo "MotioCI login completed"
+              echo "MotioCI DEV/TEST token acquired."
             }
           }
         }
       }
     }
 
-    stage('Resolve Instance IDs (DEV/TEST & PROD)') {
+    stage('MotioCI Login (PROD token via API key)') {
+      steps {
+        withCredentials([file(credentialsId: 'prod-credentials-json', variable: 'APIKEY_FILE')]) {
+          container('python') {
+            script {
+              env.MOTIO_TOKEN_PROD = sh(
+                script: '''
+                  set -euo pipefail
+                  cd MotioCI/api/CLI
+                  # pick apiKey for instanceId=1 (PROD)
+                  apikey=$(python3 - <<'PY' "$APIKEY_FILE"
+import json,sys,os
+data=json.load(open(sys.argv[1],"r"))
+if isinstance(data, dict): data=[data]
+key=next((x.get("apiKey") for x in data if str(x.get("instanceId"))=="1"), "")
+print(key,end="")
+PY
+)
+                  [ -n "$apikey" ] || { echo "No PROD apiKey found in prod-credentials-json"; exit 1; }
+                  tok=$(python3 ci-cli.py --server="${COGNOS_SERVER_URL}" login --apiKey "$apikey" --instanceId "1" \
+                        | awk -F': ' '/Auth Token:/ {print $2}' | tr -d ' \\r\\n')
+                  [ -n "$tok" ] || { echo "Empty MotioCI token (PROD)"; exit 1; }
+                  echo -n "$tok"
+                ''',
+                returnStdout: true
+              ).trim()
+              echo "MotioCI PROD token acquired."
+            }
+          }
+        }
+      }
+    }
+
+    // ========= Resolve instance IDs by name (once) =========
+    stage('Resolve Instance IDs (by name)') {
       steps {
         container('python') {
           script {
@@ -186,7 +245,7 @@ pipeline {
               script: '''
                 set -euo pipefail
                 cd MotioCI/api/CLI
-                python3 ci-cli.py --server="${COGNOS_SERVER_URL}" instance ls --xauthtoken="${MOTIO_AUTH_TOKEN}" --json \
+                python3 ci-cli.py --server="${COGNOS_SERVER_URL}" instance ls --xauthtoken="${MOTIO_TOKEN_DEV}" --json \
                 | python3 - "${DEVTEST_INSTANCE}" <<'PY'
 import sys, json
 name = sys.argv[1]
@@ -201,7 +260,7 @@ PY
               script: '''
                 set -euo pipefail
                 cd MotioCI/api/CLI
-                python3 ci-cli.py --server="${COGNOS_SERVER_URL}" instance ls --xauthtoken="${MOTIO_AUTH_TOKEN}" --json \
+                python3 ci-cli.py --server="${COGNOS_SERVER_URL}" instance ls --xauthtoken="${MOTIO_TOKEN_PROD}" --json \
                 | python3 - "${PROD_INSTANCE}" <<'PY'
 import sys, json
 name = sys.argv[1]
@@ -221,37 +280,49 @@ PY
       }
     }
 
+    // ========= CAM Passport (service account) =========
+    // Prefer Jenkins credential 'cognos-service-account' if present; fallback to values you provided.
     stage('Get CAM Passport (TEST)') {
       steps {
-        withCredentials([file(credentialsId: 'prod-credentials-json', variable: 'CREDENTIALS_FILE')]) {
-          container('python') {
-            script {
+        script {
+          env.CAM_NAMESPACE_TEST = nsForTarget(env.DEVTEST_INSTANCE)
+        }
+        container('python') {
+          script {
+            // try to read Jenkins credential (if defined), else fallback
+            def hasCred = false
+            try {
+              withCredentials([usernamePassword(credentialsId: 'cognos-service-account', usernameVariable: 'U', passwordVariable: 'P')]) {
+                hasCred = true
+                env.CAM_PASSPORT_TEST = sh(
+                  script: '''
+                    set -euo pipefail
+                    cd MotioCI/api/CLI
+                    tmpd=$(mktemp -d)
+                    curl -sk -c "$tmpd/cookies.txt" \
+                      -d "CAMNamespace=${CAM_NAMESPACE_TEST}&CAMUsername=$U&CAMPassword=$P" \
+                      "${COGNOS_SERVER_URL}/p2pd/servlet/dispatch" >/dev/null
+                    awk '/cam_passport/ {print $7}' "$tmpd/cookies.txt" | tail -1
+                  ''',
+                  returnStdout: true
+                ).trim()
+              }
+            } catch (ignored) { hasCred = false }
+            if (!hasCred) {
               env.CAM_PASSPORT_TEST = sh(
                 script: '''
                   set -euo pipefail
                   cd MotioCI/api/CLI
-                  # Extract user/pass from JSON file credential
-                  read USER PASS <<EOF
-$(python3 - <<'PY' "$CREDENTIALS_FILE"
-import json,sys
-p=sys.argv[1]
-c=json.load(open(p,'r'))
-print(c.get('username',''))
-print(c.get('password',''))
-PY
-)
-EOF
                   tmpd=$(mktemp -d)
-                  # Login to Cognos (TEST namespace) and capture cam_passport cookie
                   curl -sk -c "$tmpd/cookies.txt" \
-                    -d "CAMNamespace=${CAM_NAMESPACE_TEST}&CAMUsername=${USER}&CAMPassword=${PASS}" \
+                    -d "CAMNamespace=${CAM_NAMESPACE_TEST}&CAMUsername=${FALLBACK_COGNOS_USER}&CAMPassword=${FALLBACK_COGNOS_PASS}" \
                     "${COGNOS_SERVER_URL}/p2pd/servlet/dispatch" >/dev/null
                   awk '/cam_passport/ {print $7}' "$tmpd/cookies.txt" | tail -1
                 ''',
                 returnStdout: true
               ).trim()
-              if (!env.CAM_PASSPORT_TEST) { error "Failed to obtain CAM Passport for TEST (namespace=${env.CAM_NAMESPACE_TEST})" }
             }
+            if (!env.CAM_PASSPORT_TEST) { error "Failed to obtain CAM Passport for TEST (namespace=${env.CAM_NAMESPACE_TEST})" }
           }
         }
       }
@@ -263,12 +334,12 @@ EOF
           sh '''
             set -euo pipefail
             cd MotioCI/api/CLI
-            # Target (DEV/TEST) visible
+            # DEV/TEST visible
             python3 ci-cli.py --server="${COGNOS_SERVER_URL}" project ls \
-              --xauthtoken="${MOTIO_AUTH_TOKEN}" --instanceName="${DEVTEST_INSTANCE}" >/dev/null
+              --xauthtoken="${MOTIO_TOKEN_DEV}" --instanceName="${DEVTEST_INSTANCE}" >/dev/null
             # Source label visible by ID in DEV/TEST
             python3 ci-cli.py --server="${COGNOS_SERVER_URL}" label ls \
-              --xauthtoken="${MOTIO_AUTH_TOKEN}" --instanceName="${DEVTEST_INSTANCE}" --projectName="${PROJECT_NAME}" \
+              --xauthtoken="${MOTIO_TOKEN_DEV}" --instanceName="${DEVTEST_INSTANCE}" --projectName="${PROJECT_NAME}" \
               | grep -q " ${SOURCE_LABEL_ID} " || { echo "PRECHECK FAIL: Label ID ${SOURCE_LABEL_ID} not visible in DEV/TEST"; exit 4; }
             echo "Preflight (TEST) OK"
           '''
@@ -284,7 +355,7 @@ EOF
             cd MotioCI/api/CLI
             echo "Promoting Label ID ${SOURCE_LABEL_ID} from DEV -> TEST as ${TEST_TARGET_LABEL}"
             python3 ci-cli.py --server="${COGNOS_SERVER_URL}" deploy \
-              --xauthtoken="${MOTIO_AUTH_TOKEN}" \
+              --xauthtoken="${MOTIO_TOKEN_DEV}" \
               --sourceInstanceId="${DEVTEST_INSTANCE_ID}" \
               --targetInstanceId="${DEVTEST_INSTANCE_ID}" \
               --labelId="${SOURCE_LABEL_ID}" \
@@ -301,35 +372,53 @@ EOF
       }
     }
 
+    stage('Approve PROD') {
+      steps {
+        input message: "Promote TEST -> PROD? Project=${env.PROJECT_NAME}, PROD label=${env.PROD_TARGET_LABEL}", ok: "Proceed"
+      }
+    }
+
     stage('Get CAM Passport (PROD)') {
       steps {
-        withCredentials([file(credentialsId: 'prod-credentials-json', variable: 'CREDENTIALS_FILE')]) {
-          container('python') {
-            script {
+        script {
+          env.CAM_NAMESPACE_PROD = nsForTarget(env.PROD_INSTANCE)
+        }
+        container('python') {
+          script {
+            // prefer Jenkins cred; fallback to inline values you provided
+            def hasCred = false
+            try {
+              withCredentials([usernamePassword(credentialsId: 'cognos-service-account', usernameVariable: 'U', passwordVariable: 'P')]) {
+                hasCred = true
+                env.CAM_PASSPORT_PROD = sh(
+                  script: '''
+                    set -euo pipefail
+                    cd MotioCI/api/CLI
+                    tmpd=$(mktemp -d)
+                    curl -sk -c "$tmpd/cookies.txt" \
+                      -d "CAMNamespace=${CAM_NAMESPACE_PROD}&CAMUsername=$U&CAMPassword=$P" \
+                      "${COGNOS_SERVER_URL}/p2pd/servlet/dispatch" >/dev/null
+                    awk '/cam_passport/ {print $7}' "$tmpd/cookies.txt" | tail -1
+                  ''',
+                  returnStdout: true
+                ).trim()
+              }
+            } catch (ignored) { hasCred = false }
+            if (!hasCred) {
               env.CAM_PASSPORT_PROD = sh(
                 script: '''
                   set -euo pipefail
                   cd MotioCI/api/CLI
-                  read USER PASS <<EOF
-$(python3 - <<'PY' "$CREDENTIALS_FILE"
-import json,sys
-p=sys.argv[1]
-c=json.load(open(p,'r'))
-print(c.get('username',''))
-print(c.get('password',''))
-PY
-)
-EOF
                   tmpd=$(mktemp -d)
                   curl -sk -c "$tmpd/cookies.txt" \
-                    -d "CAMNamespace=${CAM_NAMESPACE_PROD}&CAMUsername=${USER}&CAMPassword=${PASS}" \
+                    -d "CAMNamespace=${CAM_NAMESPACE_PROD}&CAMUsername=${FALLBACK_COGNOS_USER}&CAMPassword=${FALLBACK_COGNOS_PASS}" \
                     "${COGNOS_SERVER_URL}/p2pd/servlet/dispatch" >/dev/null
                   awk '/cam_passport/ {print $7}' "$tmpd/cookies.txt" | tail -1
                 ''',
                 returnStdout: true
               ).trim()
-              if (!env.CAM_PASSPORT_PROD) { error "Failed to obtain CAM Passport for PROD (namespace=${env.CAM_NAMESPACE_PROD})" }
             }
+            if (!env.CAM_PASSPORT_PROD) { error "Failed to obtain CAM Passport for PROD (namespace=${env.CAM_NAMESPACE_PROD})" }
           }
         }
       }
@@ -342,7 +431,7 @@ EOF
             set -euo pipefail
             cd MotioCI/api/CLI
             python3 ci-cli.py --server="${COGNOS_SERVER_URL}" project ls \
-              --xauthtoken="${MOTIO_AUTH_TOKEN}" --instanceName="${PROD_INSTANCE}" >/dev/null
+              --xauthtoken="${MOTIO_TOKEN_PROD}" --instanceName="${PROD_INSTANCE}" >/dev/null
             echo "Preflight (PROD) OK"
           '''
         }
@@ -356,8 +445,8 @@ EOF
             set -euo pipefail
             cd MotioCI/api/CLI
 
-            # Find the label we just created in TEST by name to promote to PROD
-            TEST_LABEL_ID=$(python3 ci-cli.py --server="${COGNOS_SERVER_URL}" label ls --xauthtoken="${MOTIO_AUTH_TOKEN}" \
+            # Look up the label we just created in TEST by name to promote to PROD
+            TEST_LABEL_ID=$(python3 ci-cli.py --server="${COGNOS_SERVER_URL}" label ls --xauthtoken="${MOTIO_TOKEN_DEV}" \
               --instanceName="${DEVTEST_INSTANCE}" --projectName="${PROJECT_NAME}" --json \
               | python3 - <<'PY'
 import sys,json,os
@@ -372,7 +461,7 @@ PY
 
             echo "Promoting TEST label ID ${TEST_LABEL_ID} -> PROD as ${PROD_TARGET_LABEL}"
             python3 ci-cli.py --server="${COGNOS_SERVER_URL}" deploy \
-              --xauthtoken="${MOTIO_AUTH_TOKEN}" \
+              --xauthtoken="${MOTIO_TOKEN_PROD}" \
               --sourceInstanceId="${DEVTEST_INSTANCE_ID}" \
               --targetInstanceId="${PROD_INSTANCE_ID}" \
               --labelId="$TEST_LABEL_ID" \
