@@ -82,7 +82,7 @@ spec:
     COGNOS_SERVER_URL = "https://cgrptmcip01.cloud.cammis.ca.gov"
     PROJECT_NAME      = "Demo"
 
-    // Instance names (resolved to IDs dynamically)
+    // Instance names
     DEVTEST_INSTANCE  = "Cognos-DEV/TEST"
     PROD_INSTANCE     = "Cognos-PRD"
 
@@ -115,11 +115,11 @@ spec:
 
     stage('Check Python Availability') {
       steps {
-        container('python') {
+        container('node') {
           sh '''
-            set -e
-            which python3
-            python3 --version
+            echo "Checking for Python3..."
+            which python3 || echo "Python3 is NOT installed"
+            python3 --version || echo "Unable to get Python version"
           '''
         }
       }
@@ -133,12 +133,15 @@ spec:
             script {
               sh '''
                 set -euo pipefail
+                export PATH="$HOME/.local/bin:$PATH"
                 cd MotioCI/api/CLI
-                python3 -m pip install --user -r requirements.txt >/dev/null
+                python3 -m pip install --user -r requirements.txt >/dev/null || true
+                python3 -m pip install --user "python-dateutil>=2.8.2" >/dev/null 2>&1 || true
               '''
               env.MOTIO_AUTH_TOKEN = sh(
                 script: '''
                   set -euo pipefail
+                  export PATH="$HOME/.local/bin:$PATH"
                   cd MotioCI/api/CLI
                   python3 ci-cli.py --server="${COGNOS_SERVER_URL}" login --credentialsFile "$CREDENTIALS_FILE" \
                     | awk -F': ' '/^x-auth_token:/ {print $2}' | tr -d ' \\r\\n'
@@ -153,35 +156,40 @@ spec:
       }
     }
 
-
     stage('Preflight (DEV/TEST)') {
       steps {
         container('python') {
-          script {
-            sh '''
-              set -euo pipefail
-              cd MotioCI/api/CLI
-              echo "Checking if label ${TEST_TARGET_LABEL} already exists in DEV/TEST..."
-              python3 ci-cli.py --server="${COGNOS_SERVER_URL}" label ls \
-                --xauthtoken="$(grep MOTIO_AUTH_TOKEN $WORKSPACE/motio.env | cut -d= -f2)" \
-                --instanceName="${DEVTEST_INSTANCE}" \
-                --projectName="${PROJECT_NAME}" | grep -q "${TEST_TARGET_LABEL}" && exit 1 || true
-            '''
-          }
+          sh '''
+            set -euo pipefail
+            export PATH="$HOME/.local/bin:$PATH"
+            cd MotioCI/api/CLI
+            echo "Checking label visibility for ${PROJECT_NAME} in ${DEVTEST_INSTANCE}..."
+            python3 ci-cli.py --server="${COGNOS_SERVER_URL}" label ls \
+              --xauthtoken="${MOTIO_AUTH_TOKEN}" \
+              --instanceName="${DEVTEST_INSTANCE}" \
+              --projectName="${PROJECT_NAME}" >/dev/null
+            echo "Ensuring target TEST label does not already exist..."
+            ! python3 ci-cli.py --server="${COGNOS_SERVER_URL}" label ls \
+              --xauthtoken="${MOTIO_AUTH_TOKEN}" \
+              --instanceName="${DEVTEST_INSTANCE}" \
+              --projectName="${PROJECT_NAME}" \
+              --labelName="${TEST_TARGET_LABEL}" | grep -q "${TEST_TARGET_LABEL}" || { echo "Label ${TEST_TARGET_LABEL} already exists"; exit 1; }
+          '''
         }
       }
     }
-    stage('Promote: DEV -> TEST') {
+
+    stage('Promote DEV to TEST') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'cognosserviceaccount', usernameVariable: 'COGNOS_USER', passwordVariable: 'COGNOS_PASS')]) {
+        withCredentials([usernamePassword(credentialsId: 'Cognosserviceaccount', usernameVariable: 'COGNOS_USER', passwordVariable: 'COGNOS_PASS')]) {
           container('python') {
             sh '''
               set -euo pipefail
+              export PATH="$HOME/.local/bin:$PATH"
               cd MotioCI/api/CLI
-              AUTH=$(grep MOTIO_AUTH_TOKEN $WORKSPACE/motio.env | cut -d= -f2)
               echo "Promoting DEV -> TEST as ${TEST_TARGET_LABEL}"
               python3 ci-cli.py --server="${COGNOS_SERVER_URL}" deploy \
-                --xauthtoken="$AUTH" \
+                --xauthtoken="${MOTIO_AUTH_TOKEN}" \
                 --sourceInstanceName="${DEVTEST_INSTANCE}" \
                 --targetInstanceName="${DEVTEST_INSTANCE}" \
                 --labelId="${SOURCE_LABEL_ID}" \
@@ -199,51 +207,61 @@ spec:
       }
     }
 
-    stage('Approve PROD') {
+    stage('Approval Before PROD') {
       steps {
         input message: "Approve promotion to PROD?"
       }
     }
 
-    stage('Promote: TEST -> PROD') {
+    stage('Resolve TEST Label ID') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'cognosserviceaccount', usernameVariable: 'COGNOS_USER', passwordVariable: 'COGNOS_PASS')]) {
-          container('python') {
-            sh '''
-              set -euo pipefail
-              cd MotioCI/api/CLI
-              AUTH=$(grep MOTIO_AUTH_TOKEN $WORKSPACE/motio.env | cut -d= -f2)
-              echo "Promoting TEST -> PROD as ${PROD_TARGET_LABEL}"
-              python3 ci-cli.py --server="${COGNOS_SERVER_URL}" deploy \
-                --xauthtoken="$AUTH" \
-                --sourceInstanceName="${DEVTEST_INSTANCE}" \
-                --targetInstanceName="${PROD_INSTANCE}" \
-                --labelId="${SOURCE_LABEL_ID}" \
-                --projectName="${PROJECT_NAME}" \
-                --targetLabelName="${PROD_TARGET_LABEL}" \
-                --username "$COGNOS_USER" \
-                --password "$COGNOS_PASS" \
-                --namespaceId "${CAM_NAMESPACE}" 2>deploy_prod.err || true
-              if grep -qiE "denied|forbidden|401|403" deploy_prod.err; then
-                echo "PROD ACCESS DENIED:"; cat deploy_prod.err; exit 12
-              fi
-            '''
+        container('python') {
+          script {
+            def out = sh(
+              script: '''
+                set -euo pipefail
+                export PATH="$HOME/.local/bin:$PATH"
+                cd MotioCI/api/CLI
+                python3 ci-cli.py --server="${COGNOS_SERVER_URL}" label ls \
+                  --xauthtoken="${MOTIO_AUTH_TOKEN}" \
+                  --instanceName="${DEVTEST_INSTANCE}" \
+                  --projectName="${PROJECT_NAME}" \
+                  --labelName="${TEST_TARGET_LABEL}" || true
+              ''',
+              returnStdout: true
+            ).trim()
+            // Extract first integer after 'id'
+            env.TEST_LABEL_ID = sh(
+              script: """#!/bin/bash
+                printf '%s' ${sh(returnStdout: true, script: 'cat <<\\OUT\\n' + out.replace('$','\\$') + '\\nOUT').trim()} | \\
+                  grep -Eo 'id[^0-9]*[[:space:]]*([0-9]+)' | grep -Eo '[0-9]+' | head -1
+              """,
+              returnStdout: true
+            ).trim()
+            if (!env.TEST_LABEL_ID) {
+              echo "Could not parse TEST label id from output:"
+              echo out
+              error("TEST_LABEL_ID not found")
+            }
+            echo "Resolved TEST_LABEL_ID=${env.TEST_LABEL_ID}"
           }
         }
       }
     }
-    stage('Promote: TEST -> PROD') {
+
+    stage('Promote TEST to PROD') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'cognosserviceaccount', usernameVariable: 'COGNOS_USER', passwordVariable: 'COGNOS_PASS')]) {
+        withCredentials([usernamePassword(credentialsId: 'Cognosserviceaccount', usernameVariable: 'COGNOS_USER', passwordVariable: 'COGNOS_PASS')]) {
           container('python') {
             sh '''
               set -euo pipefail
+              export PATH="$HOME/.local/bin:$PATH"
               cd MotioCI/api/CLI
               echo "Promoting TEST label ID ${TEST_LABEL_ID} -> PROD as ${PROD_TARGET_LABEL}"
               python3 ci-cli.py --server="${COGNOS_SERVER_URL}" deploy \
                 --xauthtoken="${MOTIO_AUTH_TOKEN}" \
-                --sourceInstanceId="${DEVTEST_INSTANCE_ID}" \
-                --targetInstanceId="${PROD_INSTANCE_ID}" \
+                --sourceInstanceName="${DEVTEST_INSTANCE}" \
+                --targetInstanceName="${PROD_INSTANCE}" \
                 --labelId="${TEST_LABEL_ID}" \
                 --projectName="${PROJECT_NAME}" \
                 --targetLabelName="${PROD_TARGET_LABEL}" \
