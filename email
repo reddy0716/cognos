@@ -1,42 +1,31 @@
-Subject: Request to Enable Service Account for Cognos Deployments via MotioCI
+Thanks for confirming the Cognos namespace is “Azure” and that the service account CMarksSS01@intra.dhs.ca.gov is a Cognos Administrator.
 
-Hi [Admin Team],
+Our pipeline can authenticate to MotioCI (OK), but the Cognos step in deploy fails because we don’t yet have a supported non-interactive authentication method for the service account.
 
-I am working on automating Cognos deployments through MotioCI.
-The MotioCI authentication (API token) is working fine, but the pipeline is failing during the deploy step with the error:
+MotioCI supports only:
 
-DEPLOYMENT_AUTHENTICATION_FAILED: failed to authenticate to instance with ID [X]
+Username/Password + namespace, or
 
+CAM Passport ID (Cognos session token)
 
-This happens when MotioCI tries to log into the target Cognos instance (DEV/TEST and PROD) using the service account.
+Could you please enable one of the following so we can proceed?
 
-Could you please help confirm the following for the service account CMarksSS01@intra.dhs.ca.gov:
+Option A – Username/Password (preferred)
 
-Namespace ID:
+Provide a password for CMarksSS01@intra.dhs.ca.gov.
 
-What is the exact namespaceId we should use for DEV/TEST and for PROD?
+Ensure MFA is exempted for this account (non-interactive automation).
 
-(Is it Azure AD, AzureAD, or something else? Case and spaces matter.)
+Confirm the exact namespace string is Azure (we will set --namespaceId "Azure").
 
-Account Status:
+Option B – CAM Passport (API)
 
-Ensure this service account is enabled, password is valid (not expired), and no MFA/interactive login is required.
+Provide the API endpoint and request format to obtain a CAM Passport for this service account non-interactively (no MFA).
 
-Confirm it can log in directly to the Cognos portal in both environments.
+Include any required headers, body, and the token lifetime/expiry so we can refresh it in Jenkins.
 
-Permissions:
+If neither is feasible with the Azure namespace, we can use a dedicated automation account in a Cognos namespace that supports password authentication (no MFA), with the necessary permissions to deploy.
 
-Does the service account have the required Cognos roles/permissions to perform deployments via MotioCI for project Demo?
+Once one of the above is in place, the current pipeline will work end-to-end.
 
-If not, can you assign the minimal roles needed?
-
-CAM Passport (if required):
-
-If our environment requires a CAM Passport token instead of username/password for automation, can you provide the correct way to generate a service-account CAM Passport ID for CMarksSS01@intra.dhs.ca.gov?
-
-Once this account is verified for Cognos login in DEV/TEST and PROD, the pipeline should be able to complete deployments automatically.
-
-Thank you for your support. Please let me know if you need logs or the full pipeline error output.
-
-Best regards,
-[Your Name]
+Thank you!
