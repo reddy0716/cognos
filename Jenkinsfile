@@ -88,12 +88,13 @@ spec:
     PROD_INSTANCE_ID    = "1"
 
     // Label flow
-    SOURCE_LABEL_ID   = "57" // <-- starting label in DEV; override at build if needed
+    SOURCE_LABEL_ID   = "57" // starting label in DEV
     TEST_TARGET_LABEL = "TEST-PROMOTED-${BUILD_NUMBER}"
     PROD_TARGET_LABEL = "PROD-PROMOTED-${BUILD_NUMBER}"
 
-    // Cognos namespace
-    CAM_NAMESPACE     = "AzureAD"
+    // Namespaces (IDs are exact strings required by Cognos). We'll print DEV namespaces to confirm.
+    CAM_NAMESPACE_DEV = "AzureAD" // adjust after "List Namespaces (DEV)" output if needed (e.g., "Azure AD")
+    CAM_NAMESPACE_PRD = "AzureAD"
   }
 
   options {
@@ -153,6 +154,36 @@ spec:
               echo "MotioCI DEV login OK (len=${env.MOTIO_AUTH_TOKEN_DEV.size()})"
             }
           }
+        }
+      }
+    }
+
+    // ---- Discover the real namespace IDs in DEV/TEST (so --namespaceId is correct) ----
+    stage('List Namespaces (DEV)') {
+      steps {
+        container('python') {
+          sh '''
+            set -euo pipefail
+            export PATH="$HOME/.local/bin:$PATH"
+            cd MotioCI/api/CLI
+            python3 - <<'PY'
+import requests, json, queries
+CI_URL = "${COGNOS_SERVER_URL}"
+GRAPH_URL = CI_URL + "/graphql"
+headers = {"x-auth-token": "${MOTIO_AUTH_TOKEN_DEV}"}
+q = queries.GET_VERSIONED_NAMESPACES
+vars = {"id": int(${DEVTEST_INSTANCE_ID})}
+r = requests.post(GRAPH_URL, headers=headers, json={"query": q, "variables": vars}, verify=False)
+print("=== DEV/TEST Namespaces ===")
+try:
+    data = r.json()["data"]["instance"]["namespaces"]
+    for ns in data:
+        print(json.dumps(ns))  # includes the exact 'id' to use for --namespaceId
+except Exception:
+    print("Failed to parse namespaces. Raw response:")
+    print(r.text)
+PY
+          '''
         }
       }
     }
@@ -225,10 +256,20 @@ spec:
                 --targetLabelName="${TEST_TARGET_LABEL}" \
                 --username "$COGNOS_USER" \
                 --password "$COGNOS_PASS" \
-                --namespaceId "${CAM_NAMESPACE}" 2>deploy_test.err
+                --namespaceId "${CAM_NAMESPACE_DEV}" 2>deploy_test.err || true
 
-              if grep -qiE "denied|forbidden|401|403|error" deploy_test.err; then
-                echo "TEST DEPLOY ERROR:"; cat deploy_test.err; exit 12
+              echo "---- DEV->TEST deploy stderr (for diagnostics) ----"
+              cat deploy_test.err || true
+              echo "---------------------------------------------------"
+
+              if grep -qiE "denied|forbidden|401|403|DEPLOYMENT_AUTHENTICATION_FAILED|failed to authenticate" deploy_test.err; then
+                echo "TEST DEPLOY AUTH ERROR (check namespaceId and service account in DEV)."
+                exit 12
+              fi
+
+              if grep -qiE "error|exception|traceback" deploy_test.err; then
+                echo "TEST DEPLOY FAILED:"
+                exit 13
               fi
             '''
           }
@@ -288,6 +329,36 @@ spec:
       }
     }
 
+    // (Optional) List PROD namespaces if you’re unsure of the exact ID string
+    stage('List Namespaces (PROD)') {
+      steps {
+        container('python') {
+          sh '''
+            set -euo pipefail
+            export PATH="$HOME/.local/bin:$PATH"
+            cd MotioCI/api/CLI
+            python3 - <<'PY'
+import requests, json, queries
+CI_URL = "${COGNOS_SERVER_URL}"
+GRAPH_URL = CI_URL + "/graphql"
+headers = {"x-auth-token": "${MOTIO_AUTH_TOKEN_PROD}"}
+q = queries.GET_VERSIONED_NAMESPACES
+vars = {"id": int(${PROD_INSTANCE_ID})}
+r = requests.post(GRAPH_URL, headers=headers, json={"query": q, "variables": vars}, verify=False)
+print("=== PROD Namespaces ===")
+try:
+    data = r.json()["data"]["instance"]["namespaces"]
+    for ns in data:
+        print(json.dumps(ns))
+except Exception:
+    print("Failed to parse namespaces. Raw response:")
+    print(r.text)
+PY
+          '''
+        }
+      }
+    }
+
     stage('Promote TEST to PROD') {
       steps {
         withCredentials([usernamePassword(credentialsId: 'Cognosserviceaccount', usernameVariable: 'COGNOS_USER', passwordVariable: 'COGNOS_PASS')]) {
@@ -308,10 +379,20 @@ spec:
                 --targetLabelName="${PROD_TARGET_LABEL}" \
                 --username "$COGNOS_USER" \
                 --password "$COGNOS_PASS" \
-                --namespaceId "${CAM_NAMESPACE}" 2>deploy_prod.err
+                --namespaceId "${CAM_NAMESPACE_PRD}" 2>deploy_prod.err || true
 
-              if grep -qiE "denied|forbidden|401|403|error" deploy_prod.err; then
-                echo "PROD DEPLOY ERROR:"; cat deploy_prod.err; exit 12
+              echo "---- TEST->PROD deploy stderr (for diagnostics) ----"
+              cat deploy_prod.err || true
+              echo "----------------------------------------------------"
+
+              if grep -qiE "denied|forbidden|401|403|DEPLOYMENT_AUTHENTICATION_FAILED|failed to authenticate" deploy_prod.err; then
+                echo "PROD DEPLOY AUTH ERROR (check namespaceId and service account in PROD)."
+                exit 22
+              fi
+
+              if grep -qiE "error|exception|traceback" deploy_prod.err; then
+                echo "PROD DEPLOY FAILED:"
+                exit 23
               fi
             '''
           }
