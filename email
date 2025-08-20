@@ -1,0 +1,42 @@
+Subject: Request to Enable Service Account for Cognos Deployments via MotioCI
+
+Hi [Admin Team],
+
+I am working on automating Cognos deployments through MotioCI.
+The MotioCI authentication (API token) is working fine, but the pipeline is failing during the deploy step with the error:
+
+DEPLOYMENT_AUTHENTICATION_FAILED: failed to authenticate to instance with ID [X]
+
+
+This happens when MotioCI tries to log into the target Cognos instance (DEV/TEST and PROD) using the service account.
+
+Could you please help confirm the following for the service account CMarksSS01@intra.dhs.ca.gov:
+
+Namespace ID:
+
+What is the exact namespaceId we should use for DEV/TEST and for PROD?
+
+(Is it Azure AD, AzureAD, or something else? Case and spaces matter.)
+
+Account Status:
+
+Ensure this service account is enabled, password is valid (not expired), and no MFA/interactive login is required.
+
+Confirm it can log in directly to the Cognos portal in both environments.
+
+Permissions:
+
+Does the service account have the required Cognos roles/permissions to perform deployments via MotioCI for project Demo?
+
+If not, can you assign the minimal roles needed?
+
+CAM Passport (if required):
+
+If our environment requires a CAM Passport token instead of username/password for automation, can you provide the correct way to generate a service-account CAM Passport ID for CMarksSS01@intra.dhs.ca.gov?
+
+Once this account is verified for Cognos login in DEV/TEST and PROD, the pipeline should be able to complete deployments automatically.
+
+Thank you for your support. Please let me know if you need logs or the full pipeline error output.
+
+Best regards,
+[Your Name]
