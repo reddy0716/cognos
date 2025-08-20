@@ -1,10 +1,7 @@
 /*
 =======================================================================================
-This file is being updated constantly by the DevOps team to introduce new enhancements
-based on the template.  If you have suggestions for improvement,
-please contact the DevOps team so that we can incorporate the changes into the
-template.  In the meantime, if you have made changes here or don't want this file to be
-updated, please indicate so at the beginning of this file.
+If you have suggestions for improvement, contact DevOps so we can fold changes
+into the template. If you don't want this file updated automatically, indicate so.
 =======================================================================================
 */
 
@@ -82,12 +79,16 @@ spec:
     COGNOS_SERVER_URL = "https://cgrptmcip01.cloud.cammis.ca.gov"
     PROJECT_NAME      = "Demo"
 
-    // Instance names
+    // Instance names (for readability)
     DEVTEST_INSTANCE  = "Cognos-DEV/TEST"
     PROD_INSTANCE     = "Cognos-PRD"
 
+    // Instance IDs (to avoid CLI prompts)
+    DEVTEST_INSTANCE_ID = "3"
+    PROD_INSTANCE_ID    = "1"
+
     // Label flow
-    SOURCE_LABEL_ID   = "57" // <-- override at build if needed
+    SOURCE_LABEL_ID   = "57" // <-- starting label in DEV; override at build if needed
     TEST_TARGET_LABEL = "TEST-PROMOTED-${BUILD_NUMBER}"
     PROD_TARGET_LABEL = "PROD-PROMOTED-${BUILD_NUMBER}"
 
@@ -107,7 +108,7 @@ spec:
         script {
           echo "Branch: ${env.GIT_BRANCH}"
           echo "Project: ${env.PROJECT_NAME}"
-          echo "Instances: DEV/TEST='${env.DEVTEST_INSTANCE}' PROD='${env.PROD_INSTANCE}'"
+          echo "Instances: DEV/TEST='${env.DEVTEST_INSTANCE}' (ID=${env.DEVTEST_INSTANCE_ID})  PROD='${env.PROD_INSTANCE}' (ID=${env.PROD_INSTANCE_ID})"
           echo "Source Label ID (DEV): ${env.SOURCE_LABEL_ID}"
         }
       }
@@ -217,17 +218,17 @@ spec:
               echo "Promoting DEV -> TEST as ${TEST_TARGET_LABEL}"
               python3 ci-cli.py --server="${COGNOS_SERVER_URL}" deploy \
                 --xauthtoken="${MOTIO_AUTH_TOKEN_DEV}" \
-                --sourceInstanceName="${DEVTEST_INSTANCE}" \
-                --targetInstanceName="${DEVTEST_INSTANCE}" \
+                --sourceInstanceId="${DEVTEST_INSTANCE_ID}" \
+                --targetInstanceId="${DEVTEST_INSTANCE_ID}" \
                 --labelId="${SOURCE_LABEL_ID}" \
                 --projectName="${PROJECT_NAME}" \
                 --targetLabelName="${TEST_TARGET_LABEL}" \
                 --username "$COGNOS_USER" \
                 --password "$COGNOS_PASS" \
-                --namespaceId "${CAM_NAMESPACE}" 2>deploy_test.err || true
+                --namespaceId "${CAM_NAMESPACE}" 2>deploy_test.err
 
-              if grep -qiE "denied|forbidden|401|403" deploy_test.err; then
-                echo "TEST ACCESS DENIED:"; cat deploy_test.err; exit 12
+              if grep -qiE "denied|forbidden|401|403|error" deploy_test.err; then
+                echo "TEST DEPLOY ERROR:"; cat deploy_test.err; exit 12
               fi
             '''
           }
@@ -235,8 +236,31 @@ spec:
       }
     }
 
+    stage('Verify TEST Label Created') {
+      steps {
+        container('python') {
+          sh '''
+            set -euo pipefail
+            export PATH="$HOME/.local/bin:$PATH"
+            cd MotioCI/api/CLI
+
+            echo "Verifying ${TEST_TARGET_LABEL} exists in DEV/TEST..."
+            python3 ci-cli.py --server="${COGNOS_SERVER_URL}" label ls \
+              --xauthtoken="${MOTIO_AUTH_TOKEN_DEV}" \
+              --instanceName="${DEVTEST_INSTANCE}" \
+              --projectName="${PROJECT_NAME}" \
+              --labelName="${TEST_TARGET_LABEL}" | grep -q "${TEST_TARGET_LABEL}"
+          '''
+        }
+      }
+    }
+
     stage('Approval Before PROD') {
-      steps { input message: "Approve promotion to PROD?" }
+      steps {
+        timeout(time: 1, unit: 'HOURS') {
+          input message: "Approve promotion from TEST to PROD?", ok: "Promote to PROD"
+        }
+      }
     }
 
     stage('Resolve TEST Label ID') {
@@ -277,17 +301,17 @@ spec:
               echo "Promoting TEST label ID ${TEST_LABEL_ID} -> PROD as ${PROD_TARGET_LABEL}"
               python3 ci-cli.py --server="${COGNOS_SERVER_URL}" deploy \
                 --xauthtoken="${MOTIO_AUTH_TOKEN_PROD}" \
-                --sourceInstanceName="${DEVTEST_INSTANCE}" \
-                --targetInstanceName="${PROD_INSTANCE}" \
+                --sourceInstanceId="${DEVTEST_INSTANCE_ID}" \
+                --targetInstanceId="${PROD_INSTANCE_ID}" \
                 --labelId="${TEST_LABEL_ID}" \
                 --projectName="${PROJECT_NAME}" \
                 --targetLabelName="${PROD_TARGET_LABEL}" \
                 --username "$COGNOS_USER" \
                 --password "$COGNOS_PASS" \
-                --namespaceId "${CAM_NAMESPACE}" 2>deploy_prod.err || true
+                --namespaceId "${CAM_NAMESPACE}" 2>deploy_prod.err
 
-              if grep -qiE "denied|forbidden|401|403" deploy_prod.err; then
-                echo "PROD ACCESS DENIED:"; cat deploy_prod.err; exit 12
+              if grep -qiE "denied|forbidden|401|403|error" deploy_prod.err; then
+                echo "PROD DEPLOY ERROR:"; cat deploy_prod.err; exit 12
               fi
             '''
           }
