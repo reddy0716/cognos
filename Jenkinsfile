@@ -1,11 +1,19 @@
 /*
 =======================================================================================
-This pipeline automates Cognos promotions via MotioCI CLI with secure auth, TLS, and
-traceable labels. It is parameterized for any source->target path (DEV/SIT/UAT/PRD).
+This file is being updated constantly by the DevOps team to introduce new enhancements
+based on the template.  If you have suggestions for improvement,
+please contact the DevOps team so that we can incorporate the changes into the
+template.  In the meantime, if you have made changes here or don't want this file to be
+updated, please indicate so at the beginning of this file.
 =======================================================================================
 */
 
+def branch     = env.BRANCH_NAME ?: "DEV"
+def namespace  = env.NAMESPACE   ?: "dev"
+def cloudName  = env.CLOUD_NAME == "openshift" ? "openshift" : "kubernetes"
 def workingDir = "/home/jenkins/agent"
+
+APP_NAME = "combined-devops-cognos-deployments"
 
 pipeline {
   agent {
@@ -16,6 +24,10 @@ kind: Pod
 spec:
   serviceAccountName: jenkins
   volumes:
+    - name: dockersock
+      hostPath: { path: /var/run/docker.sock }
+    - emptyDir: {}
+      name: varlibcontainers
     - name: jenkins-trusted-ca-bundle
       configMap:
         name: jenkins-trusted-ca-bundle
@@ -23,195 +35,270 @@ spec:
         optional: true
   containers:
     - name: jnlp
+      securityContext: { privileged: true }
+      envFrom:
+        - configMapRef: { name: jenkins-agent-env, optional: true }
       env:
-        - name: GIT_SSL_CAINFO
-          value: "/etc/pki/tls/certs/ca-bundle.crt"
+        - { name: GIT_SSL_CAINFO, value: "/etc/pki/tls/certs/ca-bundle.crt" }
       volumeMounts:
-        - name: jenkins-trusted-ca-bundle
-          mountPath: /etc/pki/tls/certs
-
+        - { name: jenkins-trusted-ca-bundle, mountPath: /etc/pki/tls/certs }
+    - name: node
+      image: registry.access.redhat.com/ubi8/nodejs-16:latest
+      tty: true
+      command: ["/bin/bash"]
+      securityContext: { privileged: true }
+      workingDir: ${workingDir}
+      envFrom:
+        - configMapRef: { name: jenkins-agent-env, optional: true }
+      env:
+        - { name: HOME,   value: ${workingDir} }
+        - { name: BRANCH, value: ${branch} }
+        - { name: GIT_SSL_CAINFO, value: "/etc/pki/tls/certs/ca-bundle.crt" }
+      volumeMounts:
+        - { name: jenkins-trusted-ca-bundle, mountPath: /etc/pki/tls/certs }
     - name: python
       image: 136299550619.dkr.ecr.us-west-2.amazonaws.com/cammisboto3:1.2.0
       tty: true
       command: ["/bin/bash"]
+      securityContext: { privileged: true }
       workingDir: ${workingDir}
+      envFrom:
+        - configMapRef: { name: jenkins-agent-env, optional: true }
       env:
-        - name: HOME
-          value: ${workingDir}
-        - name: GIT_SSL_CAINFO
-          value: "/etc/pki/tls/certs/ca-bundle.crt"
-        - name: REQUESTS_CA_BUNDLE
-          value: "/etc/pki/tls/certs/ca-bundle.crt"   # python requests trusts CA
-        - name: SSL_CERT_FILE
-          value: "/etc/pki/tls/certs/ca-bundle.crt"   # openssl trusts CA
+        - { name: HOME,   value: ${workingDir} }
+        - { name: BRANCH, value: ${branch} }
+        - { name: GIT_SSL_CAINFO,     value: "/etc/pki/tls/certs/ca-bundle.crt" }
+        - { name: REQUESTS_CA_BUNDLE, value: "/etc/pki/tls/certs/ca-bundle.crt" }
       volumeMounts:
-        - name: jenkins-trusted-ca-bundle
-          mountPath: /etc/pki/tls/certs
+        - { name: jenkins-trusted-ca-bundle, mountPath: /etc/pki/tls/certs }
 """
     }
+  }
+
+  environment {
+    GIT_BRANCH        = "${BRANCH_NAME}"
+
+    // MotioCI server & project
+    COGNOS_SERVER_URL = "https://cgrptmcip01.cloud.cammis.ca.gov"
+    PROJECT_NAME      = "Demo"
+
+    // Instance names
+    DEVTEST_INSTANCE  = "Cognos-DEV/TEST"
+    PROD_INSTANCE     = "Cognos-PRD"
+
+    // Label flow
+    SOURCE_LABEL_ID   = "57" // <-- override at build if needed
+    TEST_TARGET_LABEL = "TEST-PROMOTED-${BUILD_NUMBER}"
+    PROD_TARGET_LABEL = "PROD-PROMOTED-${BUILD_NUMBER}"
+
+    // Cognos namespace
+    CAM_NAMESPACE     = "AzureAD"
   }
 
   options {
     disableConcurrentBuilds()
     timestamps()
-  }
-
-  parameters {
-    string(name: 'MOTIO_SERVER_URL',      defaultValue: 'https://cgrptmcip01.cloud.cammis.ca.gov', description: 'MotioCI server URL')
-    string(name: 'SOURCE_INSTANCE_NAME',  defaultValue: 'Cognos-DEV/TEST', description: 'Source instance (MotioCI instanceName)')
-    string(name: 'TARGET_INSTANCE_NAME',  defaultValue: 'Cognos-PRD',      description: 'Target instance (MotioCI instanceName)')
-    string(name: 'PROJECT_NAME',          defaultValue: 'Demo',            description: 'MotioCI project name')
-    string(name: 'SOURCE_INSTANCE_ID',    defaultValue: '3',               description: 'Source instanceId (numeric)')
-    string(name: 'TARGET_INSTANCE_ID',    defaultValue: '1',               description: 'Target instanceId (numeric)')
-    string(name: 'LABEL_ID',              defaultValue: '57',              description: 'Label ID to promote (numeric)')
-    string(name: 'TARGET_LABEL_NAME',     defaultValue: 'PROMOTED-${BUILD_TAG}', description: 'Target label name to create on target')
-    string(name: 'NAMESPACE_ID',          defaultValue: 'AzureAD',         description: 'Cognos namespaceId')
-  }
-
-  environment {
-    WORKDIR = "${workingDir}"
+    timeout(time: 45, unit: 'MINUTES')
   }
 
   stages {
-    stage('Initialize') {
+    stage("Initialize") {
       steps {
         script {
-          echo "Starting MotioCI promotion: ${params.SOURCE_INSTANCE_NAME} -> ${params.TARGET_INSTANCE_NAME}"
+          echo "Branch: ${env.GIT_BRANCH}"
+          echo "Project: ${env.PROJECT_NAME}"
+          echo "Instances: DEV/TEST='${env.DEVTEST_INSTANCE}' PROD='${env.PROD_INSTANCE}'"
+          echo "Source Label ID (DEV): ${env.SOURCE_LABEL_ID}"
         }
       }
     }
 
     stage('Check Python Availability') {
       steps {
-        container('python') {
+        container('node') {
           sh '''
-            set -e
-            which python3
-            python3 --version
-            python3 -m pip --version || true
-            # Show CA file presence
-            ls -l /etc/pki/tls/certs/ca-bundle.crt || true
+            echo "Checking for Python3..."
+            which python3 || echo "Python3 is NOT installed"
+            python3 --version || echo "Unable to get Python version"
           '''
         }
       }
     }
 
-    stage('Install MotioCI CLI Deps') {
+    // ---- MotioCI login (DEV/TEST) ----
+    stage('MotioCI Login (DEV)') {
       steps {
-        container('python') {
-          sh '''
-            set -e
-            cd MotioCI/api/CLI
-            python3 -m pip install --user -r requirements.txt
-          '''
-        }
-      }
-    }
-
-    stage('MotioCI Login') {
-      steps {
-        withCredentials([file(credentialsId: 'prod-credentials-json', variable: 'CREDENTIALS_FILE')]) {
+        withCredentials([file(credentialsId: 'motio-dev-credentials-json', variable: 'DEV_CRED_FILE')]) {
           container('python') {
             script {
-              env.MOTIO_AUTH_TOKEN = sh(
-                script: """
-                  set -e
+              sh '''
+                set -euo pipefail
+                export PATH="$HOME/.local/bin:$PATH"
+                cd MotioCI/api/CLI
+                python3 -m pip install --user -r requirements.txt >/dev/null || true
+                python3 -m pip install --user "python-dateutil>=2.8.2" >/dev/null 2>&1 || true
+              '''
+              env.MOTIO_AUTH_TOKEN_DEV = sh(
+                script: '''
+                  set -euo pipefail
+                  export PATH="$HOME/.local/bin:$PATH"
                   cd MotioCI/api/CLI
-                  python3 ci-cli.py --server="${params.MOTIO_SERVER_URL}" login --credentialsFile "$CREDENTIALS_FILE" \
-                  | awk -F': ' '/Auth Token:/ {print \$2}'
-                """,
+                  python3 ci-cli.py --server="${COGNOS_SERVER_URL}" login --credentialsFile "$DEV_CRED_FILE" \
+                    | awk -F': ' '/^x-auth_token:/ {print $2}' | tr -d ' \\r\\n'
+                ''',
                 returnStdout: true
               ).trim()
-
-              if (!env.MOTIO_AUTH_TOKEN) {
-                error("Login failed: MOTIO_AUTH_TOKEN is empty")
-              }
-              echo "Login OK: token captured (not printed)."
+              if (!env.MOTIO_AUTH_TOKEN_DEV) { error "MotioCI DEV token is empty" }
+              echo "MotioCI DEV login OK (len=${env.MOTIO_AUTH_TOKEN_DEV.size()})"
             }
           }
         }
       }
     }
 
-    stage('Create Version Label (Traceability)') {
+    // ---- MotioCI login (PROD) ----
+    stage('MotioCI Login (PROD)') {
+      steps {
+        withCredentials([file(credentialsId: 'motio-prod-credentials-json', variable: 'PROD_CRED_FILE')]) {
+          container('python') {
+            script {
+              env.MOTIO_AUTH_TOKEN_PROD = sh(
+                script: '''
+                  set -euo pipefail
+                  export PATH="$HOME/.local/bin:$PATH"
+                  cd MotioCI/api/CLI
+                  python3 ci-cli.py --server="${COGNOS_SERVER_URL}" login --credentialsFile "$PROD_CRED_FILE" \
+                    | awk -F': ' '/^x-auth_token:/ {print $2}' | tr -d ' \\r\\n'
+                ''',
+                returnStdout: true
+              ).trim()
+              if (!env.MOTIO_AUTH_TOKEN_PROD) { error "MotioCI PROD token is empty" }
+              echo "MotioCI PROD login OK (len=${env.MOTIO_AUTH_TOKEN_PROD.size()})"
+            }
+          }
+        }
+      }
+    }
+
+    stage('Preflight (DEV/TEST)') {
       steps {
         container('python') {
           sh '''
-            set -e
+            set -euo pipefail
+            export PATH="$HOME/.local/bin:$PATH"
             cd MotioCI/api/CLI
-            VERSION_NAME="${JOB_NAME}-${BUILD_NUMBER}"
-            echo "Creating label: $VERSION_NAME on ${PROJECT_NAME} in ${SOURCE_INSTANCE_NAME}"
-            python3 ci-cli.py --server="${MOTIO_SERVER_URL}" label create \
-              --xauthtoken="${MOTIO_AUTH_TOKEN}" \
-              --instanceName="${SOURCE_INSTANCE_NAME}" \
+
+            echo "Checking label visibility for ${PROJECT_NAME} in ${DEVTEST_INSTANCE}..."
+            python3 ci-cli.py --server="${COGNOS_SERVER_URL}" label ls \
+              --xauthtoken="${MOTIO_AUTH_TOKEN_DEV}" \
+              --instanceName="${DEVTEST_INSTANCE}" \
+              --projectName="${PROJECT_NAME}" >/dev/null
+
+            echo "Ensuring target TEST label does not already exist..."
+            ! python3 ci-cli.py --server="${COGNOS_SERVER_URL}" label ls \
+              --xauthtoken="${MOTIO_AUTH_TOKEN_DEV}" \
+              --instanceName="${DEVTEST_INSTANCE}" \
               --projectName="${PROJECT_NAME}" \
-              --name="$VERSION_NAME" \
-              --versionedItemIds="[]"
+              --labelName="${TEST_TARGET_LABEL}" | grep -q "${TEST_TARGET_LABEL}" || { echo "Label ${TEST_TARGET_LABEL} already exists"; exit 1; }
           '''
         }
       }
     }
 
-    stage('Deploy (Promote)') {
+    stage('Promote DEV to TEST') {
       steps {
-        withCredentials([string(credentialsId: 'cognos-cam-passport-id', variable: 'CAM_PASSPORT_ID')]) {
+        withCredentials([usernamePassword(credentialsId: 'Cognosserviceaccount', usernameVariable: 'COGNOS_USER', passwordVariable: 'COGNOS_PASS')]) {
           container('python') {
             sh '''
-              set -e
+              set -euo pipefail
+              export PATH="$HOME/.local/bin:$PATH"
               cd MotioCI/api/CLI
 
-              echo "Verifying access to target project before deploy..."
-              python3 ci-cli.py --server="${MOTIO_SERVER_URL}" project ls \
-                --xauthtoken="${MOTIO_AUTH_TOKEN}" \
-                --instanceName="${TARGET_INSTANCE_NAME}" \
-                | grep -q "${PROJECT_NAME}"
-
-              echo "Running deploy..."
-              python3 ci-cli.py --server="${MOTIO_SERVER_URL}" deploy \
-                --xauthtoken="${MOTIO_AUTH_TOKEN}" \
-                --sourceInstanceId="${SOURCE_INSTANCE_ID}" \
-                --targetInstanceId="${TARGET_INSTANCE_ID}" \
-                --labelId="${LABEL_ID}" \
+              echo "Promoting DEV -> TEST as ${TEST_TARGET_LABEL}"
+              python3 ci-cli.py --server="${COGNOS_SERVER_URL}" deploy \
+                --xauthtoken="${MOTIO_AUTH_TOKEN_DEV}" \
+                --sourceInstanceName="${DEVTEST_INSTANCE}" \
+                --targetInstanceName="${DEVTEST_INSTANCE}" \
+                --labelId="${SOURCE_LABEL_ID}" \
                 --projectName="${PROJECT_NAME}" \
-                --targetLabelName="${TARGET_LABEL_NAME}" \
-                --camPassportId="${CAM_PASSPORT_ID}" \
-                --namespaceId="${NAMESPACE_ID}"
+                --targetLabelName="${TEST_TARGET_LABEL}" \
+                --username "$COGNOS_USER" \
+                --password "$COGNOS_PASS" \
+                --namespaceId "${CAM_NAMESPACE}" 2>deploy_test.err || true
 
-              echo "Deploy CLI exit code OK."
+              if grep -qiE "denied|forbidden|401|403" deploy_test.err; then
+                echo "TEST ACCESS DENIED:"; cat deploy_test.err; exit 12
+              fi
             '''
           }
         }
       }
     }
 
-    stage('Post-Deploy Verification') {
+    stage('Approval Before PROD') {
+      steps { input message: "Approve promotion to PROD?" }
+    }
+
+    stage('Resolve TEST Label ID') {
       steps {
         container('python') {
           sh '''
-            set -e
+            set -euo pipefail
+            export PATH="$HOME/.local/bin:$PATH"
             cd MotioCI/api/CLI
-            echo "Checking target labels contain ${TARGET_LABEL_NAME}..."
-            python3 ci-cli.py --server="${MOTIO_SERVER_URL}" label ls \
-              --xauthtoken="${MOTIO_AUTH_TOKEN}" \
-              --instanceName="${TARGET_INSTANCE_NAME}" \
-              --projectName="${PROJECT_NAME}" \
-              | grep -q "${TARGET_LABEL_NAME}"
-            echo "Verification OK: label ${TARGET_LABEL_NAME} present in target."
+
+            echo "Looking up TEST label id for name: ${TEST_TARGET_LABEL}"
+            OUT=$(python3 ci-cli.py --server="${COGNOS_SERVER_URL}" label ls \
+                    --xauthtoken="${MOTIO_AUTH_TOKEN_DEV}" \
+                    --instanceName="${DEVTEST_INSTANCE}" \
+                    --projectName="${PROJECT_NAME}" \
+                    --labelName="${TEST_TARGET_LABEL}" || true)
+
+            TEST_LABEL_ID=$(printf "%s" "$OUT" | grep -Eo 'id[^0-9]*[[:space:]]*([0-9]+)' | grep -Eo '[0-9]+' | head -1)
+            [ -n "$TEST_LABEL_ID" ] || { echo "Failed to parse TEST label id. Output:"; echo "$OUT"; exit 6; }
+
+            echo "Resolved TEST_LABEL_ID=$TEST_LABEL_ID"
+            echo "$TEST_LABEL_ID" > ../TEST_LABEL_ID.txt
           '''
+        }
+      }
+    }
+
+    stage('Promote TEST to PROD') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'Cognosserviceaccount', usernameVariable: 'COGNOS_USER', passwordVariable: 'COGNOS_PASS')]) {
+          container('python') {
+            sh '''
+              set -euo pipefail
+              export PATH="$HOME/.local/bin:$PATH"
+              cd MotioCI/api/CLI
+              TEST_LABEL_ID=$(cat ../TEST_LABEL_ID.txt)
+
+              echo "Promoting TEST label ID ${TEST_LABEL_ID} -> PROD as ${PROD_TARGET_LABEL}"
+              python3 ci-cli.py --server="${COGNOS_SERVER_URL}" deploy \
+                --xauthtoken="${MOTIO_AUTH_TOKEN_PROD}" \
+                --sourceInstanceName="${DEVTEST_INSTANCE}" \
+                --targetInstanceName="${PROD_INSTANCE}" \
+                --labelId="${TEST_LABEL_ID}" \
+                --projectName="${PROJECT_NAME}" \
+                --targetLabelName="${PROD_TARGET_LABEL}" \
+                --username "$COGNOS_USER" \
+                --password "$COGNOS_PASS" \
+                --namespaceId "${CAM_NAMESPACE}" 2>deploy_prod.err || true
+
+              if grep -qiE "denied|forbidden|401|403" deploy_prod.err; then
+                echo "PROD ACCESS DENIED:"; cat deploy_prod.err; exit 12
+              fi
+            '''
+          }
         }
       }
     }
   }
 
   post {
-    success {
-      echo "✅ MotioCI promotion completed and verified: ${params.SOURCE_INSTANCE_NAME} -> ${params.TARGET_INSTANCE_NAME}"
-    }
-    failure {
-      echo "❌ MotioCI promotion failed. Check stage logs above."
-    }
-    always {
-      echo "Pipeline finished."
-    }
+    always  { echo "Pipeline execution finished." }
+    success { echo "DEV->TEST and TEST->PROD promotion completed successfully." }
+    failure { echo "Pipeline failed." }
   }
 }
