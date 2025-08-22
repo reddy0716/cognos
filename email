@@ -1,10 +1,4 @@
-curl -k -X POST "https://cgrptmcip01.cloud.cammis.ca.gov/api/graphql" \
-  -H "Content-Type: application/json" \
-  -H "x-auth-token: f7748bc6-8010-48e1-8c1b-5f7aef921922" \
-  -d '{
-    "query": "query ($instanceId: String!, $projectName: String!) { project(instanceId: $instanceId, name: $projectName) { labels { nodes { id name labelType } } } }",
-    "variables": {
-      "instanceId": "1",
-      "projectName": "Demo"
-    }
-  }'
+curl -s -k -X POST "$HOST/api/graphql" \
+ -H 'Content-Type: application/json' \
+ -H "x-auth-token: $TOKEN" \
+ -d '{"query":"{ __type(name:\"Query\") { fields { name args { name type { name kind ofType { name kind } } } } } }"}' | jq .
