@@ -1,31 +1,10 @@
-Thanks for confirming the Cognos namespace is “Azure” and that the service account CMarksSS01@intra.dhs.ca.gov is a Cognos Administrator.
-
-Our pipeline can authenticate to MotioCI (OK), but the Cognos step in deploy fails because we don’t yet have a supported non-interactive authentication method for the service account.
-
-MotioCI supports only:
-
-Username/Password + namespace, or
-
-CAM Passport ID (Cognos session token)
-
-Could you please enable one of the following so we can proceed?
-
-Option A – Username/Password (preferred)
-
-Provide a password for CMarksSS01@intra.dhs.ca.gov.
-
-Ensure MFA is exempted for this account (non-interactive automation).
-
-Confirm the exact namespace string is Azure (we will set --namespaceId "Azure").
-
-Option B – CAM Passport (API)
-
-Provide the API endpoint and request format to obtain a CAM Passport for this service account non-interactively (no MFA).
-
-Include any required headers, body, and the token lifetime/expiry so we can refresh it in Jenkins.
-
-If neither is feasible with the Azure namespace, we can use a dedicated automation account in a Cognos namespace that supports password authentication (no MFA), with the necessary permissions to deploy.
-
-Once one of the above is in place, the current pipeline will work end-to-end.
-
-Thank you!
+curl -k -X POST "https://cgrptmcip01.cloud.cammis.ca.gov/api/graphql" \
+  -H "Content-Type: application/json" \
+  -H "x-auth-token: f7748bc6-8010-48e1-8c1b-5f7aef921922" \
+  -d '{
+    "query": "query ($instanceId: String!, $projectName: String!) { project(instanceId: $instanceId, name: $projectName) { labels { nodes { id name labelType } } } }",
+    "variables": {
+      "instanceId": "1",
+      "projectName": "Demo"
+    }
+  }'
