@@ -1,11 +1,34 @@
-def load_credentials_from_json(file_path: str = "credentials.json") -> str | None:
+stage('Deploy') {
+  steps {
+    withCredentials([usernamePassword(credentialsId: 'cognos-service-user', usernameVariable: 'COG_USER', passwordVariable: 'COG_PASS')]) {
+      container('python') {
+        sh '''
+          set -euo pipefail
+          cd MotioCI/api/CLI
 
+          echo "Sanity: list projects on Cognos-PRD..."
+          python3 ci-cli.py --server="https://cgrptmcip01.cloud.cammis.ca.gov" \
+            project ls --xauthtoken="${TOKEN}" --instanceName="Cognos-PRD"
 
+          # Do the deployment (adjust ids/names as needed)
+          python3 ci-cli.py --server="https://cgrptmcip01.cloud.cammis.ca.gov" \
+            --non-interactive deploy \
+            --xauthtoken="${TOKEN}" \
+            --sourceInstanceId=3 \
+            --targetInstanceId=1 \
+            --labelId=57 \
+            --projectName="Demo" \
+            --targetLabelName="PROMOTED-20250712-115" \
+            --username="${COG_USER}" \
+            --password="${COG_PASS}" \
+            --namespaceId="azure"
 
-  from typing import Optional  # add this near the top with other imports
-
-def load_credentials_from_json(file_path: str = "credentials.json") -> Optional[str]:
-
-
-
-def load_credentials_from_json(file_path: str = "credentials.json") -> Optional[str]:
+          echo "Verification: labels after deployment"
+          python3 ci-cli.py --server="https://cgrptmcip01.cloud.cammis.ca.gov" \
+            label ls --xauthtoken="${TOKEN}" --instanceName="Cognos-PRD" --projectName="Demo" \
+            | tee verify_labels.json
+        '''
+      }
+    }
+  }
+}
