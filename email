@@ -1,4 +1,21 @@
-curl -s -k -X POST "$HOST/api/graphql" \
- -H 'Content-Type: application/json' \
- -H "x-auth-token: $TOKEN" \
- -d '{"query":"{ __type(name:\"Query\") { fields { name args { name type { name kind ofType { name kind } } } } } }"}' | jq .
+set -e
+    cd MotioCI/api/CLI
+    TOKEN=$(python3 ci-cli.py --server="$MOTIO_SERVER" --non-interactive login --credentialsFile "$CREDENTIALS_FILE" | tail -n 1 | tr -d "\\r")
+    # Fail if empty
+    if [ -z "$TOKEN" ]; then
+      echo "Login produced empty token" >&2
+      exit 1
+    fi
+    # Fail if token still contains whitespace/newlines (safety)
+    if echo "$TOKEN" | grep -q "[[:space:]]"; then
+      echo "Token contains whitespace/newlines; refusing to continue" >&2
+      echo "Raw token was: =====" >&2
+      echo "$TOKEN" >&2
+      echo "=====" >&2
+      exit 1
+    fi
+    echo "$TOKEN"
+  ''',
+  returnStdout: true
+).trim()
+echo "MotioCI login completed - token captured."
