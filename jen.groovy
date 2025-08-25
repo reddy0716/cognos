@@ -1,10 +1,21 @@
-def parse_args():
-    # Format for command line: subject verb flags
-    # Options for first positional argument: login, instance, project, label, label version, versioned items, and logout
-    parent_parser = argparse.ArgumentParser(
-        description="description: sample Python CLI to perform queries using the GraphiQL API.")
-    parent_parser.add_argument('--server', type=str, required=True,
-                               help="provide link to GraphiQL API for the commands to run")
-    # 👇 NEW: Accept --non-interactive so Jenkins doesn't break
-    parent_parser.add_argument('--non-interactive', action='store_true',
-                               help="Run in CI-safe mode: disable interactive prompts and fail instead.")
+if args.subject == "login":
+    # Priority order: 1. --credentials, 2. --credentialsFile, 3. interactive
+    if args.credentials is not None:
+        credentials_to_use = args.credentials
+    else:
+        credentials_to_use = load_credentials_from_json(args.credentialsFile)
+        if credentials_to_use is None:
+            # In CI, this should fail fast; interactively you could fall back
+            print("ERROR: No credentials provided and credentialsFile not found/invalid.", file=sys.stderr)
+            sys.exit(1)
+
+    token = login.login_init(credentials_to_use)
+    if not token:
+        print("ERROR: Login failed (no token returned).", file=sys.stderr)
+        sys.exit(1)
+
+    # IMPORTANT: print ONLY the token to stdout (no extra text)
+    print(token)
+    sys.exit(0)
+else:
+    constants.X_AUTH_TOKEN = args.xauthtoken
