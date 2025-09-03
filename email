@@ -1,21 +1,9 @@
-set -e
-    cd MotioCI/api/CLI
-    TOKEN=$(python3 ci-cli.py --server="$MOTIO_SERVER" --non-interactive login --credentialsFile "$CREDENTIALS_FILE" | tail -n 1 | tr -d "\\r")
-    # Fail if empty
-    if [ -z "$TOKEN" ]; then
-      echo "Login produced empty token" >&2
-      exit 1
-    fi
-    # Fail if token still contains whitespace/newlines (safety)
-    if echo "$TOKEN" | grep -q "[[:space:]]"; then
-      echo "Token contains whitespace/newlines; refusing to continue" >&2
-      echo "Raw token was: =====" >&2
-      echo "$TOKEN" >&2
-      echo "=====" >&2
-      exit 1
-    fi
-    echo "$TOKEN"
-  ''',
-  returnStdout: true
-).trim()
-echo "MotioCI login completed - token captured."
+Hi [Manager],
+
+While working on the MotioCI deployment pipeline, I noticed that our Jenkins credential prod-credentials-json only contains the PROD API key.
+
+For a DEV→PRD promotion, MotioCI expects the authentication token to have read access on the source (DEV/TEST) and write access on the target (PRD). If the PROD service account doesn’t have access to DEV/TEST, we may need:
+
+Either to grant the PROD account cross-instance permissions (preferred – simpler, one token), or
+
+To maintain a separate DEV credential in Jenkins and switch between the two tokens in the pipeline.
