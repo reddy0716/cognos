@@ -1,11 +1,8 @@
 stage('Auth: Cognos API session (API key)') {
   steps {
     container('python') {
-      withCredentials([
-        string(credentialsId: 'cognos-api-key-prd', variable: 'COGNOS_API_KEY')
-      ]) {
+      withCredentials([string(credentialsId: 'cognos-api-key-prd', variable: 'COGNOS_API_KEY')]) {
         sh '''
-          # POSIX-safe flags
           set -eu
           (set -o pipefail) 2>/dev/null || true
 
@@ -20,19 +17,17 @@ stage('Auth: Cognos API session (API key)') {
           rm -f login.json session.json session.redacted.json headers.txt cookies.txt extensions.json || true
           mkdir -p MotioCI/api
 
-          # Build API-key payload
+          # Step 1: PUT /session with API key
           cat > login.json <<JSON
 { "parameters": [ { "name": "CAMAPILoginKey", "value": "${COGNOS_API_KEY}" } ] }
 JSON
 
-          # Step 1: PUT /session -> expect session_key in JSON
           curl --fail-with-body -sS -X PUT "$BASE/session" \
                -H "Content-Type: application/json" \
                -d @login.json \
                -c cookies.txt -b cookies.txt \
                -D headers.txt -o session.json
 
-          # Extract session_key (do NOT print it)
           SESSION_KEY=$(python3 -c 'import json; print(json.load(open("session.json")).get("session_key",""))')
           if [ -z "$SESSION_KEY" ]; then
             echo "ERROR: No session_key returned from Cognos." >&2
@@ -40,23 +35,28 @@ JSON
             exit 1
           fi
 
-          # Step 2: GET /session to obtain XSRF-TOKEN cookie
-          curl --fail-with-body -sS "$BASE/session" \
-               -c cookies.txt -b cookies.txt \
-               -D headers.txt -o /dev/null
-
-          # Extract XSRF token (may or may not be present)
-          XSRF=$(awk '$1 ~ /^#HttpOnly_/ {sub("^#HttpOnly_", "", $1)} $6=="XSRF-TOKEN" {print $7}' cookies.txt | tail -n1 || true)
-
-          # Build IBM-BA-Authorization header safely (some tenants return "CAM <key>", others just "<key>")
+          # Build IBM-BA-Authorization header safely
           case "$SESSION_KEY" in
             "CAM "*) AUTH_VALUE="$SESSION_KEY" ;;
             "CAM"*)  AUTH_VALUE="$SESSION_KEY" ;;
             *)       AUTH_VALUE="CAM $SESSION_KEY" ;;
           esac
 
-          # Step 3: sanity call (POSIX-safe header building)
-          # build argv for curl using positional parameters, not arrays
+          # Step 2: GET /session WITH AUTH to obtain XSRF-TOKEN cookie
+          curl --fail-with-body -sS "$BASE/session" \
+               -H "IBM-BA-Authorization: $AUTH_VALUE" \
+               -H "Accept: application/json" \
+               -c cookies.txt -b cookies.txt \
+               -D headers.txt -o /dev/null
+
+          # Extract XSRF token (cookie jar first, then Set-Cookie header)
+          XSRF=$(awk '$1 ~ /^#HttpOnly_/ {sub("^#HttpOnly_", "", $1)} $6=="XSRF-TOKEN" {print $7}' cookies.txt | tail -n1 || true)
+          if [ -z "${XSRF:-}" ]; then
+            XSRF=$(awk 'BEGIN{IGNORECASE=1} /^Set-Cookie:/ && $0 ~ /XSRF-TOKEN/ {match($0,/XSRF-TOKEN=([^;]+)/,m); if (m[1]) print m[1] }' headers.txt | tail -n1 || true)
+          fi
+
+          # Step 3: sanity call → /extensions
+          # Build headers (POSIX-safe)
           set -- -H "IBM-BA-Authorization: $AUTH_VALUE"
           if [ -n "${XSRF:-}" ]; then
             set -- "$@" -H "X-XSRF-TOKEN: ${XSRF}"
@@ -79,15 +79,11 @@ JSON
         '''
       }
     }
-
-    // Load values into Jenkins env for later stages
     script {
       def envFile = readFile('MotioCI/api/motio_env').trim()
       envFile.split("\n").each { line -> def (k,v) = line.split('=', 2); env[k] = v }
       echo "Auth stage complete: session_key + XSRF ready."
     }
-
-    // Optional redacted artifacts
     archiveArtifacts artifacts: 'login.json,session.redacted.json,headers.txt,cookies.txt,extensions.json', onlyIfSuccessful: false
   }
 }
