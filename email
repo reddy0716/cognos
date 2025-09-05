@@ -1,90 +1,619 @@
-stage('Get CAM Passport (auto; fallback to secret)') {
-  steps {
-    container('python') {
-      withCredentials([
-        usernamePassword(credentialsId: 'Cognosserviceaccount', usernameVariable: 'COG_USER', passwordVariable: 'COG_PASS'),
-        string(credentialsId: 'cognos-cam-passport-prd', variable: 'CAMPASSPORT_FALLBACK') // create this once (Secret Text)
-      ]) {
-        sh '''
-          set -euo pipefail
-          rm -f cookies.txt headers.txt login_resp.txt namespaces_target.json || true
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-          # IMPORTANT: use the PRD Cognos URL (that issues the cookie you saw in the browser)
-          BASE="https://dhcsprodcognos.ca.analytics.ibm.com/bi"
+import json
+import argparse
+import ast
+import os
+import sys
+import urllib3
+from typing import Optional, Tuple
 
-          echo ">>> Step 1: Start session (collect cookies; some envs set anti-CSRF here)"
-          curl --fail-with-body -sS -c cookies.txt -b cookies.txt -D headers.txt \
-               "${BASE}/v1/session" -o /dev/null || true
+import requests
 
-          # Try to read a common anti-CSRF cookie/token if Cognos sets one (name varies by setup)
-          XSRF=$(awk '$1 ~ /^#HttpOnly_/ {sub("^#HttpOnly_", "", $1)} $6 ~ /XSRF|CSRF|cognosXsrf/i {print $7}' cookies.txt | tail -n1 || true)
-          if [ -n "${XSRF:-}" ]; then
-            echo "Found potential XSRF token cookie."
-          else
-            echo "No XSRF cookie found; proceeding."
-          fi
+# Local modules (shipped with the CLI)
+import login
+import projects
+import versioned_items
+import labels
+import label_versions
+import deployment
+import constants
+import instances
+import loginInput
+import queries  # noqa: F401 (imported for other modules)
 
-          echo ">>> Step 2: POST login with namespace credentials"
-          cat > login.json <<JSON
-{
-  "parameters": [
-    { "name": "CAMNamespace", "value": "${NAMESPACE_ID}" },
-    { "name": "CAMUsername",  "value": "${COG_USER}" },
-    { "name": "CAMPassword",  "value": "${COG_PASS}" }
-  ]
-}
-JSON
+# ---- TLS / SSL ----
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-          set +e
-          if [ -n "${XSRF:-}" ]; then
-            curl --fail-with-body -sS -c cookies.txt -b cookies.txt -X POST "${BASE}/v1/login" \
-                 -H "Content-Type: application/json" \
-                 -H "X-XSRF-TOKEN: ${XSRF}" \
-                 -d @login.json \
-                 -D headers.txt \
-                 -o login_resp.txt
-          else
-            curl --fail-with-body -sS -c cookies.txt -b cookies.txt -X POST "${BASE}/v1/login" \
-                 -H "Content-Type: application/json" \
-                 -d @login.json \
-                 -D headers.txt \
-                 -o login_resp.txt
-          fi
-          rc=$?
-          set -e
+# Monkey patch requests to disable SSL verification globally (as in the original)
+_original_post = requests.post
+def _patched_post(*args, **kwargs):
+    kwargs['verify'] = False
+    return _original_post(*args, **kwargs)
+requests.post = _patched_post
 
-          if [ $rc -ne 0 ]; then
-            echo "Login POST returned non-zero (rc=$rc). Will try fallback credential."
-          fi
 
-          echo ">>> Step 3: Extract cam_passport from cookie jar"
-          CAM=$(awk '$1 ~ /^#HttpOnly_/ {sub("^#HttpOnly_", "", $1)} $6 ~ /cam_passport/ {print $7}' cookies.txt | tail -n1 || true)
+# ---------------- Helpers ----------------
+def mask_credentials_for_logging(credentials_string: str) -> str:
+    """Safely mask credentials for logging (not used in CI token path)."""
+    try:
+        creds = json.loads(credentials_string)
+        masked_creds = []
+        for cred in creds:
+            masked_cred = {}
+            for key, value in cred.items():
+                if key.lower() in ['apikey', 'password', 'token', 'secret']:
+                    masked_cred[key] = '*' * 8
+                else:
+                    masked_cred[key] = value
+            masked_creds.append(masked_cred)
+        return json.dumps(masked_creds)
+    except Exception:
+        return "*** MASKED CREDENTIALS ***"
 
-          if [ -z "${CAM:-}" ]; then
-            if [ -n "${CAMPASSPORT_FALLBACK:-}" ]; then
-              echo "Using fallback CAMPASSPORT from Jenkins Secret (rotate as needed)."
-              CAM="${CAMPASSPORT_FALLBACK}"
-            else
-              echo "ERROR: Could not obtain cam_passport and no fallback Secret provided." >&2
-              echo "Capture headers/login_resp for troubleshooting."
-              exit 1
-            fi
-          else
-            echo "Obtained fresh cam_passport from Cognos."
-          fi
 
-          # Export for later stages (do NOT echo the value)
-          printf "CAMPASSPORT=%s\n" "$CAM" >> MotioCI/api/motio_env
-        '''
-      }
+def load_credentials_from_json(file_path: str = "credentials.json") -> Optional[str]:
+    """
+    Load credentials from a JSON file and return as a JSON string.
+    DO NOT print anything here to keep stdout clean for token capture.
+    """
+    try:
+        if not os.path.exists(file_path):
+            print(f"ERROR: Credentials file '{file_path}' not found!", file=sys.stderr)
+            return None
+
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+
+        return json.dumps(data)
+
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Invalid JSON format in credentials file - {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"ERROR: Failed to load credentials file - {e}", file=sys.stderr)
+        return None
+
+
+def _json_safely(resp) -> Optional[dict]:
+    """Return resp.json() or None if parsing fails."""
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _dig_for_token(d: dict, field_chain: Tuple[str, ...]) -> Optional[str]:
+    """
+    Try to dig into nested dict with a chain like ('data','loginWithCam','token').
+    Returns the token string if found and vaguely plausible.
+    """
+    cur = d
+    for f in field_chain:
+        if not isinstance(cur, dict) or f not in cur:
+            return None
+        cur = cur[f]
+    return cur if isinstance(cur, str) and len(cur) >= 16 else None
+
+
+def login_with_cam(cam_passport_id: str, namespace_id: str, explicit_mutation: Optional[str] = None) -> Optional[str]:
+    """
+    Attempt to exchange a Cognos CAMPassport + namespaceId for a MotioCI token.
+    Tries a provided mutation name first, then a list of common ones.
+    Returns the token string or None.
+    """
+    headers = {'Content-Type': 'application/json'}
+
+    candidates = []
+    if explicit_mutation:
+        m = explicit_mutation.strip()
+        # (mutation name, full gql string, json path head)
+        candidates.append((
+            m,
+            f"mutation($pass:String!,$ns:String!){{ {m}(camPassportId:$pass, namespaceId:$ns){{ token }} }}",
+            ('data', m, 'token')
+        ))
+
+    # Common mutation names seen across MotioCI builds/tenants
+    for m in (
+        "loginWithCam",
+        "loginWithCamPassport",
+        "exchangeCamPassport",
+        "createTokenFromCamPassport",
+    ):
+        candidates.append((
+            m,
+            f"mutation($pass:String!,$ns:String!){{ {m}(camPassportId:$pass, namespaceId:$ns){{ token }} }}",
+            ('data', m, 'token')
+        ))
+
+    for field_name, gql, chain in candidates:
+        try:
+            resp = requests.post(
+                constants.GRAPH_URL,
+                headers=headers,
+                json={'query': gql, 'variables': {'pass': cam_passport_id, 'ns': namespace_id}}
+            )
+            d = _json_safely(resp)
+            if not d:
+                continue
+            token = _dig_for_token(d, chain)
+            if token:
+                return token
+        except Exception:
+            # Try next candidate
+            continue
+    return None
+
+
+# ---------------- Arg parsing ----------------
+def parse_args():
+    parent_parser = argparse.ArgumentParser(
+        description="Sample Python CLI to perform MotioCI GraphQL API operations."
+    )
+    parent_parser.add_argument(
+        '--server', type=str, required=True,
+        help="Base URL for the MotioCI server (e.g. https://host)"
+    )
+    parent_parser.add_argument(
+        '--non-interactive', action='store_true',
+        help="CI-safe mode: disable interactive prompts and fail instead."
+    )
+
+    subject_parser = parent_parser.add_subparsers(dest="subject")
+
+    # ---- login ----
+    login_parser = subject_parser.add_parser(
+        'login',
+        help="Login to MotioCI and emit x-auth-token to stdout."
+    )
+    login_parser.add_argument(
+        '--credentials', type=str, metavar='',
+        help="Credentials JSON string (alternative to --credentialsFile)."
+    )
+    login_parser.add_argument(
+        '--credentialsFile', type=str, default="credentials.json", metavar='',
+        help="Path to JSON file containing credentials (default: credentials.json)."
+    )
+    # NEW: CAMPassport-based login path
+    login_parser.add_argument(
+        '--camPassportId', type=str, metavar='',
+        help="Use a Cognos CAMPassport (e.g., from PRD) for non-interactive login."
+    )
+    login_parser.add_argument(
+        '--namespaceId', type=str, metavar='',
+        help="Namespace id associated with the CAMPassport (e.g., AzureAD)."
+    )
+    login_parser.add_argument(
+        '--camLoginMutationName', type=str, default=None, metavar='',
+        help="Explicit GraphQL mutation name to exchange CAMPassport for token (optional)."
+    )
+
+    # ---- instance ----
+    instance_subparser = subject_parser.add_parser("instance", help="Queries on instances.")
+    instance_verb_subparser = instance_subparser.add_subparsers(dest="verb")
+    instance_ls_parser = instance_verb_subparser.add_parser("ls", help="List instances available to the user.")
+    instance_ls_parser.add_argument('--xauthtoken', type=str, required=True, help="x-auth-token from login.")
+
+    # ---- project ----
+    project_subparser = subject_parser.add_parser("project", help="Queries on projects.")
+    project_verb_subparser = project_subparser.add_subparsers(dest="verb")
+    project_ls_parser = project_verb_subparser.add_parser("ls", help="List projects.")
+    project_ls_parser.add_argument('--xauthtoken', type=str, required=True, help="x-auth-token from login.")
+    project_ls_parser.add_argument('--instanceName', type=str, metavar='', help="Filter by instance name.")
+
+    # ---- label ----
+    label_subparser = subject_parser.add_parser("label", help="Queries/mutations on labels.")
+    label_verb_subparser = label_subparser.add_subparsers(dest="verb")
+
+    label_create_parser = label_verb_subparser.add_parser("create", help="Create a new label.")
+    label_create_parser.add_argument('--xauthtoken', type=str, required=True, help="x-auth-token from login.")
+    label_create_parser.add_argument('--instanceName', type=str, metavar='', help="Instance name.")
+    label_create_parser.add_argument('--projectName', type=str, metavar='', help="Project name.")
+    label_create_parser.add_argument('--name', type=str, metavar='', help="Label name to create.")
+    label_create_parser.add_argument('--versionedItemIds', type=str, metavar='', help="List of item IDs.")
+
+    label_ls_parser = label_verb_subparser.add_parser("ls", help="List labels.")
+    label_ls_parser.add_argument('--xauthtoken', type=str, required=True, help="x-auth-token from login.")
+    label_ls_parser.add_argument('--instanceName', type=str, metavar='', help="Instance name.")
+    label_ls_parser.add_argument('--projectName', type=str, metavar='', help="Project name.")
+    label_ls_parser.add_argument('--labelName', type=str, metavar='', help="Specific label name.")
+
+    # ---- labelVersion ----
+    label_version_subparser = subject_parser.add_parser("labelVersion", help="Queries on label versions.")
+    label_version_verb_subparser = label_version_subparser.add_subparsers(dest="verb")
+    label_version_ls_parser = label_version_verb_subparser.add_parser("ls", help="List label versions.")
+    label_version_ls_parser.add_argument('--xauthtoken', type=str, required=True, help="x-auth-token from login.")
+    label_version_ls_parser.add_argument('--instanceName', type=str, metavar='', help="Instance name.")
+    label_version_ls_parser.add_argument('--projectName', type=str, metavar='', help="Project name.")
+    label_version_ls_parser.add_argument('--labelName', type=str, metavar='', help="Label name.")
+
+    # ---- deploy ----
+    deployment_parser = subject_parser.add_parser("deploy", help="Execute a deployment.")
+    deployment_parser.add_argument('--xauthtoken', type=str, required=True, help="x-auth-token from login.")
+    deployment_parser.add_argument('--sourceInstanceId', type=int, metavar='', help="Source instance id.")
+    deployment_parser.add_argument('--sourceInstanceName', type=str, metavar='', help="Source instance name.")
+
+    label_source_group = deployment_parser.add_mutually_exclusive_group(required=True)
+    label_source_group.add_argument('--labelId', type=int, metavar='', help="Source label id.")
+    label_source_group.add_argument('--labelVersionId', type=int, metavar='', help="Source label version id.")
+    label_source_group.add_argument('--versionedItemIds', type=str, metavar='', help="Create ad-hoc label with IDs.")
+    label_source_group.add_argument('--searchPath', nargs='+', type=str, action='append', metavar='',
+                                    help="Paths for ad-hoc label item discovery.")
+
+    target_instance_group = deployment_parser.add_mutually_exclusive_group(required=True)
+    target_instance_group.add_argument('--targetInstanceId', type=int, metavar='', help="Target instance id.")
+    target_instance_group.add_argument('--targetInstanceName', type=str, metavar='', help="Target instance name.")
+    target_instance_group.add_argument('--targetUnversionedInstanceId', type=int, metavar='', help="Unversioned id.")
+    target_instance_group.add_argument('--targetUnversionedInstanceName', type=str, metavar='', help="Unversioned name.")
+
+    deployment_parser.add_argument('--targetLabelName', type=str, metavar='', help="Target label name to create.")
+    deployment_parser.add_argument('--projectName', type=str, metavar='', help="Target project name")
+    deployment_parser.add_argument('--projectId', type=int, metavar='', help="Target project id")
+
+    auth_group = deployment_parser.add_mutually_exclusive_group(required=True)
+    auth_group.add_argument('--camPassportId', type=str, metavar='', help="Portal authentication.")
+    auth_group.add_argument('--username', type=str, metavar='', help="Standard authentication username.")
+    deployment_parser.add_argument('--password', type=str, metavar='', help="Standard authentication password.")
+    deployment_parser.add_argument('--namespaceId', type=str, metavar='', help="Namespace id (e.g., azure).")
+
+    # ---- versionedItems ----
+    vi_subparser = subject_parser.add_parser("versionedItems", help="Queries on versioned items.")
+    vi_verb_subparser = vi_subparser.add_subparsers(dest="verb")
+    vi_ls_parser = vi_verb_subparser.add_parser("ls", help="List versioned items.")
+    vi_ls_parser.add_argument('--xauthtoken', type=str, required=True, help="x-auth-token from login.")
+    vi_ls_parser.add_argument('--instanceName', type=str, metavar='', help="Instance name.")
+    vi_ls_parser.add_argument('--projectName', type=str, metavar='', help="Project name.")
+    vi_ls_parser.add_argument('--searchPath', type=str, metavar='', help="Search path string.")
+    vi_ls_parser.add_argument('--currentOnly', type=bool, metavar='', help="True for current items only.")
+
+    # ---- logout ----
+    logout_parser = subject_parser.add_parser("logout", help="Logout of MotioCI.")
+    logout_parser.add_argument('--xauthtoken', type=str, required=True, help="x-auth-token from login.")
+
+    return parent_parser.parse_args()
+
+
+# ---------------- Core helpers from original ----------------
+def get_available_namespaces(target_instance_id, is_versioned):
+    variables = {'id': target_instance_id}
+    if is_versioned:
+        resp = requests.post(constants.GRAPH_URL, headers={'x-auth-token': constants.X_AUTH_TOKEN},
+                             json={'query': queries.GET_VERSIONED_NAMESPACES, 'variables': variables})
+        return resp.json()["data"]["instance"]["namespaces"]
+    else:
+        resp = requests.post(constants.GRAPH_URL, headers={'x-auth-token': constants.X_AUTH_TOKEN},
+                             json={'query': queries.GET_UNVERSIONED_NAMESPACES, 'variables': variables})
+        return resp.json()["data"]["unversionedInstance"]["namespaces"]
+
+
+def complete_standard_auth(namespaces, args):
+    """Build password auth block. Honors --non-interactive (no prompts)."""
+    valid_namespaces = [ns['id'] for ns in namespaces]
+
+    # Password
+    if args.password is None:
+        if getattr(args, "non_interactive", False):
+            print("ERROR: --password is required in --non-interactive mode.", file=sys.stderr)
+            sys.exit(2)
+        print("Username Entered: ", args.username)
+        password = input("Enter Password: ")
+    else:
+        password = args.password
+
+    # Namespace (CLI -> env -> default 'azure' if present -> prompt)
+    namespace_id_input = args.namespaceId or os.environ.get("NAMESPACE_ID")
+    if not namespace_id_input and "azure" in valid_namespaces:
+        namespace_id_input = "azure"
+
+    # Validate or prompt
+    if not namespace_id_input or namespace_id_input not in valid_namespaces:
+        if getattr(args, "non_interactive", False):
+            print(f"ERROR: Invalid or missing namespaceId. Valid options: {valid_namespaces}", file=sys.stderr)
+            sys.exit(2)
+        while not namespace_id_input or namespace_id_input not in valid_namespaces:
+            print("Invalid or missing namespaceId. Available namespaces:", valid_namespaces)
+            namespace_id_input = input("Enter namespaceId (or 'q' to quit): ")
+            if namespace_id_input == "q":
+                print("Aborted by user.", file=sys.stderr)
+                sys.exit(1)
+
+    return {
+        'password': {
+            'namespaceId': namespace_id_input,
+            'username': args.username,
+            'password': password
+        }
     }
-    script {
-      def envFile = readFile('MotioCI/api/motio_env').trim()
-      envFile.split("\n").each { line ->
-        def (k,v) = line.split('=', 2)
-        env[k] = v
-      }
-      echo "camPassportId ready (auto or fallback)."
-    }
-  }
-}
+
+
+def get_authentication(target_instance_id, is_versioned, args):
+    if args.camPassportId is not None:
+        return {'camPassportId': args.camPassportId}
+    elif args.username is not None:
+        namespaces = get_available_namespaces(target_instance_id, is_versioned)
+        return complete_standard_auth(namespaces, args)
+    else:
+        print("Error. Missing deployment credentials. Enter camPassportId or username/password.", file=sys.stderr)
+        sys.exit(2)
+
+
+def find_instance_id(instance_id, instance_name, input_string):
+    outputOptionsAvailable = False
+    instance_array = instances.get_instances_default()
+    while True:
+        if instance_id is None:
+            if instance_name is None:
+                if outputOptionsAvailable:
+                    instance_array = instances.get_instances_default()
+                    print("Error! Incorrect Input!")
+                    print("Available entries: ", end="")
+                    instances.print_instances(instance_array)
+                    print("")
+                user_input = input(input_string)
+                outputOptionsAvailable = True
+                instance_id, instance_name = assign_input(user_input)
+
+        if instance_id is not None:
+            if instances.check_if_valid_instance_id(instance_array, instance_id):
+                break
+
+        elif instance_name is not None:
+            if instances.check_if_valid_instance_name(instance_array, instance_name):
+                instance_id = instances.get_instance_id(instance_name)
+                break
+
+        instance_id = None
+        instance_name = None
+    return instance_id
+
+
+def find_unversioned_instance_id(instance_id, instance_name, input_string):
+    outputOptionsAvailable = False
+    instance_array = instances.get_unversioned_instances_default()
+    while True:
+        if instance_id is None:
+            if instance_name is None:
+                if outputOptionsAvailable:
+                    instance_array = instances.get_unversioned_instances_default()
+                    print("Error! Incorrect Input!")
+                    print("Available entries: ", end="")
+                    instances.print_instances(instance_array)
+                    print("")
+                user_input = input(input_string)
+                outputOptionsAvailable = True
+                instance_id, instance_name = assign_input(user_input)
+
+        if instance_id is not None:
+            if instances.check_if_valid_instance_id(instance_array, instance_id):
+                break
+
+        elif instance_name is not None:
+            if instances.check_if_valid_instance_name(instance_array, instance_name):
+                instance_id = instances.get_unversioned_instance_id(instance_name)
+                break
+
+        instance_id = None
+        instance_name = None
+    return instance_id
+
+
+def find_project_id(source_instance_id, project_id, project_name, input_string):
+    outputOptionsAvailable = False
+    project_list = projects.get_valid_projects(source_instance_id)
+    while True:
+        if project_id is None:
+            if project_name is None:
+                if outputOptionsAvailable:
+                    print("Error! Incorrect Input!")
+                    print("Available entries: ", end="")
+                    project_list = projects.get_valid_projects(source_instance_id)
+                    projects.print_projects(project_list)
+                    print("")
+                user_input = input(input_string)
+                outputOptionsAvailable = True
+                project_id, project_name = assign_input(user_input)
+
+        if project_id is not None:
+            if projects.check_if_valid_project_id(project_list, project_id):
+                break
+
+        elif project_name is not None:
+            if projects.check_if_valid_project_name(project_list, project_name):
+                project_id = projects.get_project_id(source_instance_id, project_name)
+                break
+
+        project_id = None
+        project_name = None
+    return project_id
+
+
+def assign_input(user_input):
+    try:
+        int_input = int(user_input)
+        return int_input, None
+    except ValueError:
+        return None, user_input
+
+
+def get_user_input_versioned_item_ids():
+    versioned_item_ids = []
+    print("Enter versionedItemIds. Press q to stop:")
+    while True:
+        curId = input("Enter id:")
+        if curId == "q":
+            break
+        response = versioned_items.get_versioned_item_by_id(int(curId))
+        if response["data"]["versionedItem"] is None:
+            print("Bad versionedItemId, enter another one")
+            continue
+        versioned_item_ids.append(int(curId))
+    return versioned_item_ids
+
+
+def get_versioned_items_from_searchpaths(args, project_id):
+    versioned_item_ids = []
+    versioned_item_ids.extend(ast.literal_eval(label_versions.get_version_ids(project_id, args.searchPath)))
+    return versioned_item_ids
+
+
+def run_deployment(args):
+    # Source instance
+    if args.sourceInstanceId is None:
+        source_instance_id = find_instance_id(args.sourceInstanceId, args.sourceInstanceName,
+                                              "Enter Source Instance Name/Id: ")
+    else:
+        source_instance_id = args.sourceInstanceId
+
+    # Source label input (mutually exclusive handled by argparse)
+    if args.labelVersionId is not None:
+        source_label_input = {'labelVersionId': args.labelVersionId}
+    elif args.labelId is not None:
+        source_label_input = {'labelId': args.labelId}
+    elif args.versionedItemIds is not None:
+        project_id = find_project_id(source_instance_id, args.projectId, args.projectName, "Enter Project Name/Id: ")
+        ids_input_string = str(args.versionedItemIds)[1:-1]
+        versionedItemIds = [int(v.strip()) for v in ids_input_string.split(",")]
+        source_label_input = {'adHoc': {'versionedItemIds': versionedItemIds, 'projectId': project_id}}
+    elif args.searchPath is not None:
+        project_id = find_project_id(source_instance_id, args.projectId, args.projectName, "Enter Project Name/Id: ")
+        source_label_input = {'adHoc': {'versionedItemIds': get_versioned_items_from_searchpaths(args, project_id),
+                                        'projectId': project_id}}
+    else:
+        print("Error. Missing source input. Enter labelVersionId, labelId, versionedItemIds, or searchPath.")
+        return
+
+    # Target instance
+    if args.targetInstanceId is not None or args.targetInstanceName is not None:
+        if args.targetLabelName is not None:
+            target_instance_id = find_instance_id(args.targetInstanceId, args.targetInstanceName,
+                                                  "Enter Target Instance Name/Id:")
+            deployment_target_input = {
+                'instance': {
+                    'id': target_instance_id,
+                    'authentication': get_authentication(target_instance_id, True, args),
+                    'labelName': args.targetLabelName
+                }
+            }
+        else:
+            print("Error. Missing target label name.")
+            return
+    elif args.targetUnversionedInstanceId is not None or args.targetUnversionedInstanceName is not None:
+        target_instance_id = find_unversioned_instance_id(args.targetUnversionedInstanceId,
+                                                          args.targetUnversionedInstanceName,
+                                                          "Enter Target Unversioned Instance Name/Id:")
+        deployment_target_input = {
+            'unversionedInstance': {
+                'id': target_instance_id,
+                'authentication': get_authentication(target_instance_id, False, args)
+            }
+        }
+    else:
+        print("Error. Missing target input. Enter targetInstanceId/Name or targetUnversionedInstanceId/Name.")
+        return
+
+    deployment.deploy(source_label_input, source_instance_id, deployment_target_input)
+    return
+
+
+# ---------------- MAIN ----------------
+args = parse_args()
+
+# Configure constants for this run
+constants.CI_URL = args.server
+constants.LOGIN_URL = constants.CI_URL + constants.LOGIN_URL
+constants.LOGOUT_URL = constants.CI_URL + constants.LOGOUT_URL
+constants.GRAPH_URL = constants.CI_URL + constants.GRAPH_URL
+
+if args.subject == "login":
+    # New path: CAMPassport-based login (non-interactive)
+    if args.camPassportId is not None:
+        ns = args.namespaceId or os.environ.get("NAMESPACE_ID")
+        if not ns:
+            print("ERROR: --namespaceId (e.g. AzureAD) is required with --camPassportId.", file=sys.stderr)
+            sys.exit(2)
+
+        token = login_with_cam(args.camPassportId, ns, args.camLoginMutationName)
+        if not token:
+            print(
+                "ERROR: CAMPassport login failed (no token returned). "
+                "Either your tenant does not expose a CAM→token mutation, or the mutation name differs.\n"
+                "Ask your MotioCI admin for the supported mutation name, then retry with "
+                "--camLoginMutationName <name>.",
+                file=sys.stderr
+            )
+            sys.exit(1)
+
+        # IMPORTANT: print ONLY the token. No extra text.
+        print(token)
+        sys.exit(0)
+
+    # Existing path: credentials JSON login (local MotioCI user)
+    if args.credentials is not None:
+        credentials_to_use = args.credentials
+    else:
+        credentials_to_use = load_credentials_from_json(args.credentialsFile)
+        if credentials_to_use is None:
+            print("ERROR: No credentials provided and credentialsFile not found/invalid.", file=sys.stderr)
+            sys.exit(1)
+
+    token = login.login_init(credentials_to_use)
+    if not token:
+        print("ERROR: Login failed (no token returned).", file=sys.stderr)
+        sys.exit(1)
+
+    # IMPORTANT: print ONLY the token. No extra text.
+    print(token)
+    sys.exit(0)
+else:
+    # Sanitize token in case caller passed with newline/spaces
+    constants.X_AUTH_TOKEN = (getattr(args, "xauthtoken", "") or "").strip()
+
+# ---------------- Dispatch ----------------
+if args.subject == "instance":
+    if args.verb == "ls":
+        print(instances.get_instances_default())
+
+elif args.subject == "project":
+    if args.verb == "ls":
+        if args.instanceName is not None:
+            projects.get_projects_specific(args.instanceName)
+        else:
+            projects.get_projects_default()
+
+elif args.subject == "label":
+    if args.verb == "create":
+        labels.create_label_init(args.instanceName, args.projectName, args.name, args.versionedItemIds)
+        print("Label Created!")
+    elif args.verb == "ls":
+        if args.labelName is not None:
+            labels.get_label_specific(args.instanceName, args.projectName, args.labelName)
+        elif args.instanceName is not None and args.projectName is not None:
+            labels.get_labels_specific(args.instanceName, args.projectName)
+        else:
+            labels.get_labels_default()
+
+elif args.subject == "deploy":
+    run_deployment(args)
+
+elif args.subject == "labelVersion":
+    if args.verb == "ls":
+        if args.instanceName is not None and args.projectName is not None and args.labelName is not None:
+            label_versions.get_label_version_specific(args.instanceName, args.projectName, args.labelName)
+        else:
+            label_versions.get_label_version_default()
+
+elif args.subject == "versionedItems":
+    if args.verb == "ls":
+        if (args.instanceName is not None and args.projectName is not None and
+                args.searchPath is not None and args.currentOnly is not None):
+            versioned_items.get_versioned_items_specific(
+                args.instanceName, args.projectName, args.searchPath, args.currentOnly
+            )
+        else:
+            versioned_items.get_versioned_items_default()
+
+elif args.subject == "logout":
+    requests.post(constants.LOGOUT_URL, headers={'x-auth-token': constants.X_AUTH_TOKEN})
+    print("Logged out!")
