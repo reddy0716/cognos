@@ -62,7 +62,7 @@ PY
             *)       AUTH_VALUE="CAM $SESSION_KEY" ;;
           esac
 
-          # Step 3: sanity call (noisy endpoint, harmless)
+          # Step 3: sanity call (harmless)
           CURL_HEADERS=(-H "IBM-BA-Authorization: $AUTH_VALUE")
           if [ -n "${XSRF:-}" ]; then
             CURL_HEADERS+=( -H "X-XSRF-TOKEN: ${XSRF}" )
@@ -75,7 +75,7 @@ PY
 
           echo "Cognos API session verified."
 
-          # Persist secrets for later stages (do NOT echo values)
+          # Persist for later stages (do NOT echo values)
           printf "COGNOS_SESSION_KEY=%s\n" "$SESSION_KEY" >  MotioCI/api/motio_env
           printf "COGNOS_XSRF=%s\n"       "${XSRF:-}"     >> MotioCI/api/motio_env
           printf "COGNOS_AUTH_VALUE=%s\n" "$AUTH_VALUE"   >> MotioCI/api/motio_env
@@ -90,5 +90,18 @@ PY
         '''
       }
     }
+
+    // 🔑 IMPORTANT: load the values into Jenkins env for later stages
+    script {
+      def envFile = readFile('MotioCI/api/motio_env').trim()
+      envFile.split("\n").each { line ->
+        def (k,v) = line.split('=', 2)
+        env[k] = v
+      }
+      echo "Auth stage complete: session_key + XSRF ready for subsequent stages."
+    }
+
+    // Optional but useful for troubleshooting (redacted)
+    archiveArtifacts artifacts: 'login.json,session.redacted.json,headers.txt,cookies.txt,extensions.json', onlyIfSuccessful: false
   }
 }
