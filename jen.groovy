@@ -5,7 +5,9 @@ stage('Auth: Cognos API session (API key)') {
         string(credentialsId: 'cognos-api-key-prd', variable: 'COGNOS_API_KEY')
       ]) {
         sh '''
-          set -euo pipefail
+          # POSIX-safe flags
+          set -eu
+          (set -o pipefail) 2>/dev/null || true
 
           echo "Installing MotioCI CLI dependencies..."
           cd MotioCI/api/CLI
@@ -31,19 +33,10 @@ JSON
                -D headers.txt -o session.json
 
           # Extract session_key (do NOT print it)
-          SESSION_KEY=$(python3 - <<'PY'
-import json,sys
-try:
-  j=json.load(open("session.json"))
-  print(j.get("session_key",""))
-except Exception:
-  print("")
-PY
-)
+          SESSION_KEY=$(python3 -c 'import json; print(json.load(open("session.json")).get("session_key",""))')
           if [ -z "$SESSION_KEY" ]; then
             echo "ERROR: No session_key returned from Cognos." >&2
-            echo "Response body:"
-            cat session.json || true
+            echo "Response body:"; cat session.json || true
             exit 1
           fi
 
@@ -62,14 +55,15 @@ PY
             *)       AUTH_VALUE="CAM $SESSION_KEY" ;;
           esac
 
-          # Step 3: sanity call (harmless)
-          CURL_HEADERS=(-H "IBM-BA-Authorization: $AUTH_VALUE")
+          # Step 3: sanity call (POSIX-safe header building)
+          # build argv for curl using positional parameters, not arrays
+          set -- -H "IBM-BA-Authorization: $AUTH_VALUE"
           if [ -n "${XSRF:-}" ]; then
-            CURL_HEADERS+=( -H "X-XSRF-TOKEN: ${XSRF}" )
+            set -- "$@" -H "X-XSRF-TOKEN: ${XSRF}"
           fi
 
           curl --fail-with-body -sS "$BASE/extensions" \
-               "${CURL_HEADERS[@]}" \
+               "$@" \
                -c cookies.txt -b cookies.txt \
                -D headers.txt -o extensions.json
 
@@ -81,27 +75,19 @@ PY
           printf "COGNOS_AUTH_VALUE=%s\n" "$AUTH_VALUE"   >> MotioCI/api/motio_env
 
           # Redact session.json for safe archiving
-          python3 - <<'PY'
-import json,sys
-j=json.load(open("session.json"))
-if "session_key" in j: j["session_key"]="***redacted***"
-open("session.redacted.json","w").write(json.dumps(j,indent=2))
-PY
+          python3 -c 'import json; j=json.load(open("session.json")); j["session_key"]="***redacted***" if "session_key" in j else None; open("session.redacted.json","w").write(json.dumps(j,indent=2))'
         '''
       }
     }
 
-    // 🔑 IMPORTANT: load the values into Jenkins env for later stages
+    // Load values into Jenkins env for later stages
     script {
       def envFile = readFile('MotioCI/api/motio_env').trim()
-      envFile.split("\n").each { line ->
-        def (k,v) = line.split('=', 2)
-        env[k] = v
-      }
-      echo "Auth stage complete: session_key + XSRF ready for subsequent stages."
+      envFile.split("\n").each { line -> def (k,v) = line.split('=', 2); env[k] = v }
+      echo "Auth stage complete: session_key + XSRF ready."
     }
 
-    // Optional but useful for troubleshooting (redacted)
+    // Optional redacted artifacts
     archiveArtifacts artifacts: 'login.json,session.redacted.json,headers.txt,cookies.txt,extensions.json', onlyIfSuccessful: false
   }
 }
