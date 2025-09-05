@@ -7,9 +7,13 @@ stage('Source checks (DEV/TEST)') {
 
         cd MotioCI/api/CLI
 
+        # Use a local var with default to avoid set -u issues if env is missing
+        SRC_ID="${SOURCE_INSTANCE_ID:-3}"
+
         echo "1) Verify DEV/TEST instance & project via GraphQL (robust)"
+        # IMPORTANT: escape $id as \\$id so shell doesn't expand it
         cat > ../src_projects.gql.json <<JSON
-{"query":"query($id: Long!){ instance(id:$id){ id name projects { edges { node { id name description }}}}}","variables":{"id":${SOURCE_INSTANCE_ID}}}
+{"query":"query(\\$id: Long!){ instance(id:\\$id){ id name projects { edges { node { id name description }}}}}","variables":{"id": ${SRC_ID} }}
 JSON
 
         curl -sS --fail-with-body -X POST "${COGNOS_SERVER_URL}/api/graphql" \
@@ -48,7 +52,7 @@ PY
 
         # Look for LABEL_ID regardless of CLI RC (some builds return non-JSON/200)
         if ! grep -E -q "(^|[^0-9])${LABEL_ID}([^0-9]|$)" ../labels_src.txt; then
-          echo "ERROR: Label id '${LABEL_ID}' not found on DEV/TEST project '${PROJECT_NAME}'." >&2
+          echo "ERROR: Label id '${LABEL_ID}' not found in DEV/TEST project '${PROJECT_NAME}'." >&2
           echo "Hint: If CLI failed (rc=${CLI_RC}), your MotioCI token may lack access to DEV/TEST."
           sed -n '1,200p' ../labels_src.txt
           exit 1
