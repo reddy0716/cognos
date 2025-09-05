@@ -12,7 +12,6 @@ stage('Pre-deploy health checks (Cognos REST + MotioCI)') {
         BASE="${COGNOS_API_BASE:-https://dhcsprodcognos.ca.analytics.ibm.com/api}/v1"
 
         echo "1) Cognos REST check: /extensions with session_key"
-        # Build headers POSIX-safely (no bash arrays)
         set -- -H "IBM-BA-Authorization: ${COGNOS_AUTH_VALUE}" -H "Accept: application/json"
         if [ -n "${COGNOS_XSRF:-}" ]; then
           set -- "$@" -H "X-XSRF-TOKEN: ${COGNOS_XSRF}"
@@ -35,16 +34,11 @@ PY
 
         echo "2) MotioCI project presence on PRD"
         cd MotioCI/api/CLI
-
-        # Get the project list as raw text and archive it
         python3 ci-cli.py --server="$COGNOS_SERVER_URL" \
           project ls --xauthtoken="${MOTIO_AUTH_TOKEN}" --instanceName="Cognos-PRD" \
           | tee projects_prd.txt
-
-        # Text-safe check for ${PROJECT_NAME} (case-insensitive)
         if ! grep -i -F -q "${PROJECT_NAME}" projects_prd.txt; then
           echo "ERROR: Project '${PROJECT_NAME}' not found on Cognos-PRD via MotioCI." >&2
-          echo "Available projects (first 200 lines):"
           sed -n '1,200p' projects_prd.txt
           exit 1
         fi
@@ -67,25 +61,27 @@ for n in ns:
   print(f"- {n.get('name')} (id={n.get('id')})")
 PY
 
-        # Resolve the namespace by name (case-insensitive, ignore spaces/symbols) and write to env file
+        # Resolve by name OR id (case-insensitive; ignore spaces/symbols)
         mkdir -p MotioCI/api
         python3 - <<'PY'
 import json, os, re, sys
 d=json.load(open("namespaces_prd.json"))
 ns=(((d.get("data") or {}).get("instance") or {}).get("namespaces") or [])
 target=os.environ.get("COGNOS_NAMESPACE","AzureAD")
-norm = lambda s: re.sub(r'[^A-Za-z0-9]', '', (s or '')).lower()
-match = None
+def norm(s): return re.sub(r'[^A-Za-z0-9]', '', (s or '')).lower()
+match=None
 for n in ns:
-    name = (n.get("name") or "")
-    if name.lower()==target.lower() or norm(name)==norm(target):
-        match = n; break
+    name=(n.get("name") or "")
+    nid =(n.get("id") or "")
+    if (name.lower()==target.lower() or nid.lower()==target.lower()
+        or norm(name)==norm(target) or norm(nid)==norm(target)):
+        match=n; break
 if not match:
     print(f"ERROR: Namespace '{target}' not found on PRD. Set COGNOS_NAMESPACE to one of:", file=sys.stderr)
     for n in ns:
         print(f"  - {n.get('name')} (id={n.get('id')})", file=sys.stderr)
     sys.exit(1)
-name = match.get("name"); nid = match.get("id")
+name=match.get("name"); nid=match.get("id")
 open("MotioCI/api/ns_resolved.env","w").write(f"RESOLVED_NAMESPACE_NAME='{name}'\\nRESOLVED_NAMESPACE_ID='{nid}'\\n")
 print(f"Resolved namespace: {name} (id={nid})")
 PY
@@ -93,7 +89,7 @@ PY
         echo "Pre-deploy health checks passed."
       '''
     }
-    // Load resolved namespace into Jenkins env for later stages (deploy)
+    // Load resolved namespace into Jenkins env for later stages
     script {
       def nsFile = 'MotioCI/api/ns_resolved.env'
       if (fileExists(nsFile)) {
@@ -107,10 +103,9 @@ PY
         }
         echo "Using namespace: ${env.RESOLVED_NAMESPACE_NAME} (id=${env.RESOLVED_NAMESPACE_ID})"
       } else {
-        echo "No resolved namespace file found; will use COGNOS_NAMESPACE: ${env.COGNOS_NAMESPACE}"
+        echo "No resolved namespace file; will use COGNOS_NAMESPACE: ${env.COGNOS_NAMESPACE}"
       }
     }
-    // Save useful artifacts (no secrets)
     archiveArtifacts artifacts: 'extensions.json,headers.txt,MotioCI/api/CLI/projects_prd.txt,namespaces_prd.json,MotioCI/api/ns_resolved.env', onlyIfSuccessful: false
   }
 }
