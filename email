@@ -1,444 +1,143 @@
-#!/usr/bin/env python3
-import json, argparse, ast, os, sys, urllib3
-import requests
-from typing import Optional
+pipeline {
+  agent { label 'python' }  // or your k8s agent; just needs Python 3 + requests
 
-# Local modules (unchanged)
-import projects, versioned_items, labels, label_versions, deployment, constants, instances, queries  # noqa: F401
-# If you still have a 'login' module, we'll try it first; otherwise we handle login ourselves.
-try:
-    import login
-except Exception:
-    login = None
+  parameters {
+    booleanParam(name: 'DRY_RUN', defaultValue: true, description: 'Plan only (no deploy)')
+    string(name: 'SEARCH_PATHS_JSON', defaultValue: '["/content/Production Reports"]',
+           description: 'JSON array of Cognos search paths to deploy from devtest')
+    string(name: 'TARGET_LABEL_NAME', defaultValue: '', description: 'Label stamped in PRD (auto if blank)')
+  }
 
-# ---- TLS / SSL ----
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-# IMPORTANT: remove the global verify=False monkey-patch for production.
-# If you must keep it temporarily, uncomment below line (less secure).
-# requests.post = (lambda f: (lambda *a, **k: f(*a, **{**k, "verify": False})))(requests.post)
+  environment {
+    MOTIO_SERVER      = 'https://YOUR-MOTIOCI-URL'
+    SRC_INSTANCE_NAME = 'devtest'
+    TGT_INSTANCE_NAME = 'prd'
+    MOTIO_PROJECT     = 'Demo'
+    NAMESPACE_ID      = 'AZuread'  // your namespace
 
-NON_INTERACTIVE = False  # set from args
+    // Jenkins credentials (configure whichever you have)
+    COGNOS_PRD_CAM_PASSPORT = credentials('cognos_prd_cam_passport')  // Secret Text (optional)
+    COGNOS_PRD_USER         = credentials('cognos_prd_username')      // Username or Secret Text (optional)
+    COGNOS_PRD_PASS         = credentials('cognos_prd_password')      // Password or Secret Text (optional)
+  }
 
-def eprint(*a): print(*a, file=sys.stderr)
+  options { timestamps(); ansiColor('xterm') }
 
-def mask_credentials_for_logging(credentials_string: str) -> str:
-    try:
-        creds = json.loads(credentials_string)
-        masked = []
-        for c in creds if isinstance(creds, list) else [creds]:
-            mc = {}
-            for k,v in (c.items() if isinstance(c, dict) else []):
-                if isinstance(v, dict):
-                    mc[k] = {kk: ('********' if kk.lower() in ('apikey','password','token','secret') else vv)
-                             for kk, vv in v.items()}
-                else:
-                    mc[k] = ('********' if k.lower() in ('apikey','password','token','secret') else v)
-            masked.append(mc)
-        return json.dumps(masked)
-    except Exception:
-        return "*** MASKED CREDENTIALS ***"
+  stages {
+    stage('Checkout & deps') {
+      steps {
+        checkout scm
+        sh '''
+          set -e
+          python3 -V
+          python3 - <<'PY'
+import sys, subprocess
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input", "requests"])
+PY
+        '''
+      }
+    }
 
-def load_credentials_from_json(file_path: str = "credentials.json") -> Optional[str]:
-    try:
-        if not os.path.exists(file_path):
-            eprint(f"ERROR: Credentials file '{file_path}' not found!")
-            return None
-        with open(file_path, 'r') as f:
-            data = json.load(f)
-        return json.dumps(data)
-    except json.JSONDecodeError as e:
-        eprint(f"ERROR: Invalid JSON in credentials file - {e}")
-        return None
-    except Exception as e:
-        eprint(f"ERROR: Failed to load credentials file - {e}")
-        return None
-
-def parse_args():
-    parent = argparse.ArgumentParser(description="MotioCI CLI (CI-safe)")
-    parent.add_argument('--server', type=str, required=True, help="Base URL for MotioCI (e.g., https://host)")
-    parent.add_argument('--non-interactive', action='store_true', help="CI mode: no prompts, fail fast.")
-
-    sub = parent.add_subparsers(dest="subject")
-
-    # ---- login ----
-    p_login = sub.add_parser('login', help="Login to MotioCI and emit x-auth-token to stdout.")
-    p_login.add_argument('--credentials', type=str, metavar='', help="Raw JSON string for credentials.")
-    p_login.add_argument('--credentialsFile', type=str, default="credentials.json", metavar='', help="Credentials file.")
-    # New direct flags
-    p_login.add_argument('--apiKey', type=str, metavar='', help="MotioCI API key / PAT.")
-    p_login.add_argument('--camPassportId', type=str, metavar='', help="CAMPassport id from Cognos.")
-    p_login.add_argument('--username', type=str, metavar='', help="Cognos username for password auth.")
-    p_login.add_argument('--password', type=str, metavar='', help="Cognos password for password auth.")
-    p_login.add_argument('--namespaceId', type=str, metavar='', help="Namespace id (e.g., AZuread).")
-
-    # ---- instance ----
-    p_inst = sub.add_parser("instance", help="Instance queries.")
-    p_inst_sub = p_inst.add_subparsers(dest="verb")
-    p_inst_ls = p_inst_sub.add_parser("ls", help="List instances.")
-    p_inst_ls.add_argument('--xauthtoken', type=str, required=True)
-
-    # ---- project ----
-    p_proj = sub.add_parser("project", help="Project queries.")
-    p_proj_sub = p_proj.add_subparsers(dest="verb")
-    p_proj_ls = p_proj_sub.add_parser("ls", help="List projects.")
-    p_proj_ls.add_argument('--xauthtoken', type=str, required=True)
-    p_proj_ls.add_argument('--instanceName', type=str, metavar='')
-
-    # ---- label ----
-    p_label = sub.add_parser("label", help="Label operations.")
-    p_label_sub = p_label.add_subparsers(dest="verb")
-
-    p_label_create = p_label_sub.add_parser("create", help="Create label.")
-    p_label_create.add_argument('--xauthtoken', type=str, required=True)
-    p_label_create.add_argument('--instanceName', type=str, metavar='')
-    p_label_create.add_argument('--projectName', type=str, metavar='')
-    p_label_create.add_argument('--name', type=str, metavar='')
-    p_label_create.add_argument('--versionedItemIds', type=str, metavar='', help='JSON list like "[1,2]" (or "[]").')
-
-    p_label_ls = p_label_sub.add_parser("ls", help="List labels.")
-    p_label_ls.add_argument('--xauthtoken', type=str, required=True)
-    p_label_ls.add_argument('--instanceName', type=str, metavar='')
-    p_label_ls.add_argument('--projectName', type=str, metavar='')
-    p_label_ls.add_argument('--labelName', type=str, metavar='')
-
-    # ---- labelVersion ----
-    p_lv = sub.add_parser("labelVersion", help="Label version queries.")
-    p_lv_sub = p_lv.add_subparsers(dest="verb")
-    p_lv_ls = p_lv_sub.add_parser("ls", help="List label versions.")
-    p_lv_ls.add_argument('--xauthtoken', type=str, required=True)
-    p_lv_ls.add_argument('--instanceName', type=str, metavar='')
-    p_lv_ls.add_argument('--projectName', type=str, metavar='')
-    p_lv_ls.add_argument('--labelName', type=str, metavar='')
-
-    # ---- deploy ----
-    p_dep = sub.add_parser("deploy", help="Execute a deployment (or plan with --dryRun).")
-    p_dep.add_argument('--xauthtoken', type=str, required=True)
-    p_dep.add_argument('--sourceInstanceId', type=int, metavar='')
-    p_dep.add_argument('--sourceInstanceName', type=str, metavar='')
-
-    g_src = p_dep.add_mutually_exclusive_group(required=True)
-    g_src.add_argument('--labelId', type=int, metavar='')
-    g_src.add_argument('--labelVersionId', type=int, metavar='')
-    g_src.add_argument('--versionedItemIds', type=str, metavar='', help='JSON list like "[1,2,3]".')
-    g_src.add_argument('--searchPath', type=str, metavar='', help='JSON array of search paths e.g. ["...","..."].')
-
-    g_tgt = p_dep.add_mutually_exclusive_group(required=True)
-    g_tgt.add_argument('--targetInstanceId', type=int, metavar='')
-    g_tgt.add_argument('--targetInstanceName', type=str, metavar='')
-    g_tgt.add_argument('--targetUnversionedInstanceId', type=int, metavar='')
-    g_tgt.add_argument('--targetUnversionedInstanceName', type=str, metavar='')
-
-    p_dep.add_argument('--targetLabelName', type=str, metavar='')
-    p_dep.add_argument('--projectName', type=str, metavar='')
-    p_dep.add_argument('--projectId', type=int, metavar='')
-
-    g_auth = p_dep.add_mutually_exclusive_group(required=False)
-    g_auth.add_argument('--camPassportId', type=str, metavar='')
-    g_auth.add_argument('--username', type=str, metavar='')
-    p_dep.add_argument('--password', type=str, metavar='')
-    p_dep.add_argument('--namespaceId', type=str, metavar='')
-
-    p_dep.add_argument('--dryRun', action='store_true', help='Print plan JSON and exit (no server-side deploy).')
-
-    return parent.parse_args()
-
-def http_login_with_payload(payload):
-    url = constants.CI_URL + constants.LOGIN_URL
-    try:
-        r = requests.post(url, json=payload)
-        # Try JSON token fields; else raw text
-        tok = None
-        if r.headers.get("content-type","").lower().startswith("application/json"):
-            data = r.json()
-            for k in ("token","xAuthToken","x-auth-token","authToken","access_token"):
-                if isinstance(data.get(k), str):
-                    tok = data[k]; break
-        else:
-            t = r.text.strip()
-            if r.status_code == 200 and len(t) > 20 and " " not in t:
-                tok = t
-        return tok, r
-    except Exception as e:
-        eprint(f"ERROR: login request failed: {e}")
-        return None, None
-
-def login_flow(args):
-    # Compose credentials JSON
-    creds_json_str = None
-    if args.credentials:  # raw JSON string
-        creds_json_str = args.credentials
-    elif args.apiKey:
-        creds_json_str = json.dumps([{"apiKey": args.apiKey}])
-    elif args.camPassportId:
-        creds_json_str = json.dumps([{"camPassportId": args.camPassportId}])
-    elif args.username and args.password and args.namespaceId:
-        creds_json_str = json.dumps([{"password": {
-            "namespaceId": args.namespaceId, "username": args.username, "password": args.password}}])
-    else:
-        creds_json_str = load_credentials_from_json(args.credentialsFile)
-        if creds_json_str is None:
-            eprint("ERROR: No credentials provided."); sys.exit(1)
-
-    # First try existing local login module (if present)
-    if login is not None:
-        try:
-            tok = login.login_init(creds_json_str)
-            if tok: return tok
-        except Exception as e:
-            eprint(f"DEBUG: local login module failed: {e}")
-
-    # Fallback: direct HTTP attempts (try a few common shapes)
-    shapes = []
-    try:
-        base = json.loads(creds_json_str)
-    except Exception:
-        base = creds_json_str  # raw string
-
-    shapes.append(base)
-    # If base is a list with {"password":{...}} add flat variant too
-    try:
-        if isinstance(base, list) and base and isinstance(base[0], dict):
-            if "password" in base[0] and isinstance(base[0]["password"], dict):
-                shapes.append({"password": base[0]["password"]})
-            if "apiKey" in base[0]:
-                shapes.append({"apiKey": base[0]["apiKey"]})
-            if "camPassportId" in base[0]:
-                shapes.append({"camPassportId": base[0]["camPassportId"]})
-    except Exception:
-        pass
-
-    last_resp = None
-    for payload in shapes:
-        tok, resp = http_login_with_payload(payload)
-        last_resp = resp or last_resp
-        if tok:
-            return tok
-
-    # If we got here, no token
-    if last_resp is not None:
-        eprint(f"[LOGIN DEBUG] status={last_resp.status_code}")
-        try:
-            eprint(last_resp.text[:2000])
-        except Exception:
-            pass
-    return None
-
-def ensure_non_interactive_input(val, name):
-    if val is None and NON_INTERACTIVE:
-        eprint(f"ERROR: missing required flag: {name}"); sys.exit(2)
-    return val
-
-def parse_json_list(s, name):
-    try:
-        v = json.loads(s)
-        if isinstance(v, list): return v
-        raise ValueError("not a list")
-    except Exception:
-        eprint(f"ERROR: {name} must be a JSON list string (e.g., \"[1,2,3]\" or \"[\\\"/content\\\"]\").")
-        sys.exit(2)
-
-def build_target_auth(args, target_instance_id, is_versioned):
-    if args.camPassportId:
-        return {'camPassportId': args.camPassportId}
-    if args.username:
-        # discover namespaces from server (optional; if not available, trust passed namespaceId)
-        nsid = args.namespaceId or os.environ.get("NAMESPACE_ID")
-        if not nsid and NON_INTERACTIVE:
-            eprint("ERROR: --namespaceId required for password auth in --non-interactive mode."); sys.exit(2)
-        return {'password': {'namespaceId': nsid, 'username': args.username, 'password': args.password}}
-    # Non-interactive default: fail fast
-    if NON_INTERACTIVE:
-        eprint("ERROR: target auth missing (provide --camPassportId or --username/--password/--namespaceId).")
-        sys.exit(2)
-    # Interactive path (fallback)
-    username = input("Enter target username: ")
-    password = input("Enter target password: ")
-    namespace = input("Enter target namespaceId: ")
-    return {'password': {'namespaceId': namespace, 'username': username, 'password': password}}
-
-def run_deployment(args):
-    # Source instance
-    src_id = args.sourceInstanceId
-    src_name = args.sourceInstanceName
-    if src_id is None and src_name is None:
-        ensure_non_interactive_input(None, "--sourceInstanceName/--sourceInstanceId")
-    if src_id is None and src_name is not None:
-        src_id = find_instance_id(src_id, src_name, "Enter Source Instance Name/Id: ")
-
-    # Source label input
-    if args.labelVersionId is not None:
-        source_label_input = {'labelVersionId': args.labelVersionId}
-    elif args.labelId is not None:
-        source_label_input = {'labelId': args.labelId}
-    elif args.versionedItemIds is not None:
-        vids = parse_json_list(args.versionedItemIds, "versionedItemIds")
-        proj_id = find_project_id(src_id, args.projectId, args.projectName, "Enter Project Name/Id: ")
-        source_label_input = {'adHoc': {'versionedItemIds': vids, 'projectId': proj_id}}
-    elif args.searchPath is not None:
-        paths = parse_json_list(args.searchPath, "searchPath")
-        proj_id = find_project_id(src_id, args.projectId, args.projectName, "Enter Project Name/Id: ")
-        # Resolve version ids from search paths
-        vids = json.loads(label_versions.get_version_ids(proj_id, [paths]))
-        source_label_input = {'adHoc': {'versionedItemIds': vids, 'projectId': proj_id}}
-    else:
-        eprint("ERROR: Missing source input. Provide one of: --labelVersionId | --labelId | --versionedItemIds | --searchPath")
-        sys.exit(2)
-
-    # Target instance
-    deployment_target_input = None
-    tgt_is_versioned = True
-    if args.targetInstanceId is not None or args.targetInstanceName is not None:
-        tgt_id = find_instance_id(args.targetInstanceId, args.targetInstanceName, "Enter Target Instance Name/Id:")
-        if not args.targetLabelName:
-            eprint("ERROR: --targetLabelName is required for versioned target."); sys.exit(2)
-        auth = build_target_auth(args, tgt_id, True)
-        deployment_target_input = {'instance': {'id': tgt_id, 'authentication': auth, 'labelName': args.targetLabelName}}
-        tgt_is_versioned = True
-    elif args.targetUnversionedInstanceId is not None or args.targetUnversionedInstanceName is not None:
-        tgt_id = find_unversioned_instance_id(args.targetUnversionedInstanceId, args.targetUnversionedInstanceName,
-                                              "Enter Target Unversioned Instance Name/Id:")
-        auth = build_target_auth(args, tgt_id, False)
-        deployment_target_input = {'unversionedInstance': {'id': tgt_id, 'authentication': auth}}
-        tgt_is_versioned = False
-    else:
-        eprint("ERROR: Missing target input. Provide targetInstance(Name/Id) or targetUnversionedInstance(Name/Id).")
-        sys.exit(2)
-
-    # Dry run: print plan JSON and exit
-    if args.dryRun:
-        plan = {
-            "sourceInstanceId": src_id,
-            "sourceLabelInput": source_label_input,
-            "target": deployment_target_input
+    stage('Resolve label') {
+      steps {
+        script {
+          def auto = "${env.BRANCH_NAME ?: 'devtest'}-${env.BUILD_NUMBER}"
+          env.EFFECTIVE_LABEL = params.TARGET_LABEL_NAME?.trim() ? params.TARGET_LABEL_NAME.trim() : auto
+          echo "Label to write on PRD: ${env.EFFECTIVE_LABEL}"
         }
-        print(json.dumps({"dryRun": True, "plan": plan}, indent=2))
-        return
+      }
+    }
 
-    # Execute
-    deployment.deploy(source_label_input, src_id, deployment_target_input)
+    // 1) Login to MotioCI using PRD CAMPassport (or fallback to PRD user/pass)
+    stage('MotioCI login → token') {
+      steps {
+        sh '''
+          set -euo pipefail
+          cd MotioCI/api/CLI
 
-def get_available_namespaces(target_instance_id, is_versioned):
-    variables = {'id': target_instance_id}
-    if is_versioned:
-        resp = requests.post(constants.GRAPH_URL, headers={'x-auth-token': constants.X_AUTH_TOKEN},
-                             json={'query': queries.GET_VERSIONED_NAMESPACES, 'variables': variables})
-        return resp.json()["data"]["instance"]["namespaces"]
-    else:
-        resp = requests.post(constants.GRAPH_URL, headers={'x-auth-token': constants.X_AUTH_TOKEN},
-                             json={'query': queries.GET_UNVERSIONED_NAMESPACES, 'variables': variables})
-        return resp.json()["data"]["unversionedInstance"]["namespaces"]
+          TOKEN=""
+          if [ -n "${COGNOS_PRD_CAM_PASSPORT}" ]; then
+            echo "Login via PRD CAMPassport..."
+            TOKEN="$(python3 ci-cli.py --server="${MOTIO_SERVER}" --non-interactive \
+                     login --camPassportId "${COGNOS_PRD_CAM_PASSPORT}")" || true
+          fi
 
-def find_instance_id(instance_id, instance_name, prompt):
-    arr = instances.get_instances_default()
-    if instance_id is not None:
-        return instance_id if instances.check_if_valid_instance_id(arr, instance_id) else None
-    if instance_name is not None:
-        if instances.check_if_valid_instance_name(arr, instance_name):
-            return instances.get_instance_id(instance_name)
-        if NON_INTERACTIVE:
-            eprint(f"ERROR: Invalid instanceName '{instance_name}'"); sys.exit(2)
-    if NON_INTERACTIVE:
-        eprint("ERROR: instance id/name required."); sys.exit(2)
-    # Interactive fallback
-    print("Available entries: ", end=""); instances.print_instances(arr); print("")
-    user_input = input(prompt); return assign_input(user_input)[0]
+          if [ -z "${TOKEN}" ] && [ -n "${COGNOS_PRD_USER}" ] && [ -n "${COGNOS_PRD_PASS}" ]; then
+            echo "Login via PRD username/password..."
+            TOKEN="$(python3 ci-cli.py --server="${MOTIO_SERVER}" --non-interactive \
+                     login --username "${COGNOS_PRD_USER}" --password "${COGNOS_PRD_PASS}" --namespaceId "${NAMESPACE_ID}")" || true
+          fi
 
-def find_unversioned_instance_id(instance_id, instance_name, prompt):
-    arr = instances.get_unversioned_instances_default()
-    if instance_id is not None:
-        return instance_id if instances.check_if_valid_instance_id(arr, instance_id) else None
-    if instance_name is not None:
-        if instances.check_if_valid_instance_name(arr, instance_name):
-            return instances.get_unversioned_instance_id(instance_name)
-        if NON_INTERACTIVE:
-            eprint(f"ERROR: Invalid unversioned instanceName '{instance_name}'"); sys.exit(2)
-    if NON_INTERACTIVE:
-        eprint("ERROR: unversioned instance id/name required."); sys.exit(2)
-    print("Available entries: ", end=""); instances.print_instances(arr); print("")
-    user_input = input(prompt); return assign_input(user_input)[0]
+          test -n "${TOKEN}" || { echo "ERROR: MotioCI login failed."; exit 1; }
+          printf "%s" "${TOKEN}" > .motio_token
+          echo "Saved token → $(pwd)/.motio_token"
+        '''
+      }
+    }
 
-def find_project_id(source_instance_id, project_id, project_name, prompt):
-    plist = projects.get_valid_projects(source_instance_id)
-    if project_id is not None:
-        return project_id if projects.check_if_valid_project_id(plist, project_id) else None
-    if project_name is not None:
-        if projects.check_if_valid_project_name(plist, project_name):
-            return projects.get_project_id(source_instance_id, project_name)
-        if NON_INTERACTIVE:
-            eprint(f"ERROR: Invalid projectName '{project_name}'"); sys.exit(2)
-    if NON_INTERACTIVE:
-        eprint("ERROR: project id/name required."); sys.exit(2)
-    projects.print_projects(plist); user_input = input(prompt); return assign_input(user_input)[0]
+    // 2) Plan (local dry-run JSON; no server-side changes)
+    stage('Plan (Dry Run)') {
+      steps {
+        sh '''
+          set -euo pipefail
+          cd MotioCI/api/CLI
+          TOKEN="$(cat .motio_token)"
 
-def assign_input(user_input):
-    try:
-        return int(user_input), None
-    except ValueError:
-        return None, user_input
+          python3 ci-cli.py --server="${MOTIO_SERVER}" deploy \
+            --xauthtoken "${TOKEN}" \
+            --sourceInstanceName "${SRC_INSTANCE_NAME}" \
+            --searchPath '${params.SEARCH_PATHS_JSON}' \
+            --projectName "${MOTIO_PROJECT}" \
+            --targetInstanceName "${TGT_INSTANCE_NAME}" \
+            --targetLabelName "${EFFECTIVE_LABEL}" \
+            --dryRun --non-interactive > "plan-${EFFECTIVE_LABEL}.json"
 
-# ---------------- MAIN ----------------
-args = parse_args()
-NON_INTERACTIVE = bool(getattr(args, "non_interactive", False))
-constants.CI_URL = args.server
-constants.LOGIN_URL = constants.CI_URL + constants.LOGIN_URL
-constants.LOGOUT_URL = constants.CI_URL + constants.LOGOUT_URL
-constants.GRAPH_URL = constants.CI_URL + constants.GRAPH_URL
+          ls -lh plan-*.json
+        '''
+        archiveArtifacts artifacts: 'MotioCI/api/CLI/plan-*.json', fingerprint: true
+      }
+    }
 
-if args.subject == "login":
-    token = login_flow(args)
-    if not token:
-        eprint("ERROR: Login failed (no token returned)."); sys.exit(1)
-    print(token); sys.exit(0)
-else:
-    # Sanitize token for other verbs
-    constants.X_AUTH_TOKEN = (getattr(args, "xauthtoken", "") or "").strip()
+    // 3) Approval & Deploy (write on PRD)
+    stage('Approval for PRD') {
+      when { expression { !params.DRY_RUN } }
+      steps { input message: "Deploy devtest → PRD as '${env.EFFECTIVE_LABEL}'?" }
+    }
 
-# Dispatch
-if args.subject == "instance":
-    if args.verb == "ls":
-        print(instances.get_instances_default())
+    stage('Deploy to PRD') {
+      when { expression { !params.DRY_RUN } }
+      steps {
+        sh '''
+          set -euo pipefail
+          cd MotioCI/api/CLI
+          TOKEN="$(cat .motio_token)"
 
-elif args.subject == "project":
-    if args.verb == "ls":
-        if args.instanceName is not None:
-            projects.get_projects_specific(args.instanceName)
-        else:
-            projects.get_projects_default()
+          # Prefer CAMPassport for target PRD auth; else user/pass
+          AUTH_FLAGS=""
+          if [ -n "${COGNOS_PRD_CAM_PASSPORT}" ]; then
+            AUTH_FLAGS="--camPassportId '${COGNOS_PRD_CAM_PASSPORT}'"
+          else
+            AUTH_FLAGS="--username '${COGNOS_PRD_USER}' --password '${COGNOS_PRD_PASS}' --namespaceId '${NAMESPACE_ID}'"
+          fi
 
-elif args.subject == "label":
-    if args.verb == "create":
-        # Parse IDs safely
-        ids = "[]"
-        if args.versionedItemIds:
-            parse_json_list(args.versionedItemIds, "versionedItemIds")  # validate
-            ids = args.versionedItemIds
-        labels.create_label_init(args.instanceName, args.projectName, args.name, ids)
-        print("Label Created!")
-    elif args.verb == "ls":
-        if args.labelName:
-            labels.get_label_specific(args.instanceName, args.projectName, args.labelName)
-        elif args.instanceName and args.projectName:
-            labels.get_labels_specific(args.instanceName, args.projectName)
-        else:
-            labels.get_labels_default()
+          eval python3 ci-cli.py --server=\\"${MOTIO_SERVER}\\" deploy \
+            --xauthtoken \\"${TOKEN}\\" \
+            --sourceInstanceName \\"${SRC_INSTANCE_NAME}\\" \
+            --searchPath '${params.SEARCH_PATHS_JSON}' \
+            --projectName \\"${MOTIO_PROJECT}\\" \
+            --targetInstanceName \\"${TGT_INSTANCE_NAME}\\" \
+            --targetLabelName \\"${EFFECTIVE_LABEL}\\" \
+            --non-interactive ${AUTH_FLAGS} | tee "deploy-${EFFECTIVE_LABEL}.log"
 
-elif args.subject == "deploy":
-    run_deployment(args)
+          ls -lh deploy-*.log
+        '''
+        archiveArtifacts artifacts: 'MotioCI/api/CLI/deploy-*.log', fingerprint: true
+      }
+    }
+  }
 
-elif args.subject == "labelVersion":
-    if args.verb == "ls":
-        if args.instanceName and args.projectName and args.labelName:
-            label_versions.get_label_version_specific(args.instanceName, args.projectName, args.labelName)
-        else:
-            label_versions.get_label_version_default()
-
-elif args.subject == "versionedItems":
-    # keep original behavior
-    pass
-
-elif args.subject == "logout":
-    try:
-        requests.post(constants.LOGOUT_URL, headers={'x-auth-token': constants.X_AUTH_TOKEN})
-        print("Logged out!")
-    except Exception as e:
-        eprint(f"Logout error: {e}")
+  post {
+    success { echo "✅ Done: read from devtest, wrote to PRD as '${env.EFFECTIVE_LABEL}'" }
+    failure { echo "❌ Failed. Check CAMPassport/credentials or namespace (${env.NAMESPACE_ID})." }
+  }
+}
