@@ -1,95 +1,53 @@
-stage('Check Instance Permissions') {
+stage('Login to Cognos API') {
   steps {
-    container('python') {
-      script {
+    script {
+      withCredentials([usernamePassword(
+        credentialsId: 'Cognos_authentication',
+        usernameVariable: 'COGNOS_USERNAME',
+        passwordVariable: 'COGNOS_PASSWORD'
+      )]) {
         sh '''
-set -euo pipefail
-cd MotioCI/api/CLI
+          set -euo pipefail
 
-if [ -z "${MOTIO_AUTH_TOKEN:-}" ]; then
-  echo "ERROR: MOTIO_AUTH_TOKEN is empty (login stage failed?)"
-  exit 1
-fi
+          # Files for response/body/status
+          RESP_BODY="response.json"
+          RESP_CODE="response.code"
 
-SERVER="https://cgrptmcip01.cloud.cammis.ca.gov"
-# PRD first, then DEV/TEST
-INSTANCES=("Cognos-PRD" "Cognos-DEV/TEST")
-PROJECT="Demo"
+          # Login request with robust curl options
+          curl --silent --show-error --fail-with-body \
+               --connect-timeout 10 --max-time 60 \
+               --retry 3 --retry-connrefused --retry-delay 2 \
+               -X PUT \
+               -H "Content-Type: application/json" \
+               -d "$(cat <<JSON
+          {
+            "username": "'"${COGNOS_USERNAME}"'",
+            "password": "'"${COGNOS_PASSWORD}"'"
+          }
+JSON
+          )" \
+          "${COGNOS_API_URL}/session" \
+          -o "$RESP_BODY" -w "%{http_code}" > "$RESP_CODE"
 
-# Use mounted CA bundle (preferred)
-export REQUESTS_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
-export SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt
-# Last resort only:
-# export PYTHONHTTPSVERIFY=0
+          # Basic HTTP code check
+          code=$(cat "$RESP_CODE" || true)
+          if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+            echo "Login failed. HTTP $code"
+            echo "Response body:"
+            cat "$RESP_BODY" || true
+            exit 1
+          fi
+        '''
 
-TIMEOUT=""
-if command -v timeout >/dev/null 2>&1; then
-  TIMEOUT="timeout 45s"
-fi
+        // Parse JSON in Jenkins and extract token safely
+        def json = readJSON file: 'response.json'
+        if (!json?.authToken) {
+          error "Failed to authenticate: 'authToken' missing in response"
+        }
 
-overall_rc=0
-
-run_check() {
-  local what="$1"    # "projects" or "labels(project)"
-  local inst="$2"
-  local cmd="$3"     # ci-cli subcommand + args (no server/token)
-  local tag="$(echo "$inst" | tr '/' '_')_${what}"
-
-  ${TIMEOUT} python3 ci-cli.py --server="$SERVER" \
-    ${cmd} \
-    1>"/tmp/${tag}.out" 2>"/tmp/${tag}.err"
-  rc=$? || true
-
-  if [ $rc -ne 0 ] || grep -qiE "access is denied|unauthorized|forbidden|401|403|certificate verify failed|ssl:|ssLError" "/tmp/${tag}.err"; then
-    echo "  !! FAIL: ${what} check failed on '${inst}'"
-    echo "----- stderr (first 100 lines) -----"
-    sed -n '1,100p' "/tmp/${tag}.err" || true
-    echo "------------------------------------"
-    return 1
-  fi
-
-  lines=$(wc -l < "/tmp/${tag}.out" || echo 0)
-  echo "  OK: ${what} check on '${inst}' (output lines: ${lines})"
-  return 0
-}
-
-for inst in "${INSTANCES[@]}"; do
-  is_prd=0
-  [ "$inst" = "Cognos-PRD" ] && is_prd=1
-
-  echo ""
-  echo "===== Checking permissions for instance: ${inst} ====="
-
-  # 1) Basic instance access: projects list
-  if ! run_check "projects" "${inst}" \
-       "project ls --xauthtoken=\\"${MOTIO_AUTH_TOKEN}\\" --instanceName=\\"${inst}\\""
-  then
-    if [ $is_prd -eq 1 ]; then
-      echo ""
-      echo "PRD access failed — failing fast before checking DEV/TEST."
-      exit 1
-    fi
-    overall_rc=1
-    continue
-  fi
-
-  # 2) Light read: labels in Demo (warn-only)
-  if ! run_check "labels(${PROJECT})" "${inst}" \
-       "label ls --xauthtoken=\\"${MOTIO_AUTH_TOKEN}\\" --instanceName=\\"${inst}\\" --projectName=\\"${PROJECT}\\""
-  then
-    echo "  !! WARN: Could not read labels for '${PROJECT}' on '${inst}'"
-  fi
-done
-
-if [ "$overall_rc" -ne 0 ]; then
-  echo ""
-  echo "At least one non-PRD instance failed basic access checks. Failing the build."
-  exit $overall_rc
-fi
-
-echo ""
-echo "All instances passed basic access checks."
-'''
+        // Store the token in env without printing it
+        env.COGNOS_AUTH_TOKEN = json.authToken.toString()
+        echo 'Successfully authenticated to Cognos API.'
       }
     }
   }
