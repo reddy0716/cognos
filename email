@@ -1,143 +1,44 @@
-pipeline {
-  agent { label 'python' }  // or your k8s agent; just needs Python 3 + requests
+stage('MotioCI login → token (CAMPassport → LDAP)') {
+  steps {
+    container('python') {
+      sh '''
+/bin/bash -lc "
+  set -Eeuo pipefail
+  cd MotioCI/api/CLI
 
-  parameters {
-    booleanParam(name: 'DRY_RUN', defaultValue: true, description: 'Plan only (no deploy)')
-    string(name: 'SEARCH_PATHS_JSON', defaultValue: '["/content/Production Reports"]',
-           description: 'JSON array of Cognos search paths to deploy from devtest')
-    string(name: 'TARGET_LABEL_NAME', defaultValue: '', description: 'Label stamped in PRD (auto if blank)')
-  }
+  # Ensure requests is present (no-op if already installed)
+  python3 -m pip -q install --no-input requests || true
 
-  environment {
-    MOTIO_SERVER      = 'https://YOUR-MOTIOCI-URL'
-    SRC_INSTANCE_NAME = 'devtest'
-    TGT_INSTANCE_NAME = 'prd'
-    MOTIO_PROJECT     = 'Demo'
-    NAMESPACE_ID      = 'AZuread'  // your namespace
+  # ====== Hardcoded settings (as requested) ======
+  MOTIO_SERVER='https://cgrptmcip01.cloud.cammis.ca.gov'
 
-    // Jenkins credentials (configure whichever you have)
-    COGNOS_PRD_CAM_PASSPORT = credentials('cognos_prd_cam_passport')  // Secret Text (optional)
-    COGNOS_PRD_USER         = credentials('cognos_prd_username')      // Username or Secret Text (optional)
-    COGNOS_PRD_PASS         = credentials('cognos_prd_password')      // Password or Secret Text (optional)
-  }
+  # Try CAMPassport first
+  CAM_PASSPORT_ID='hiufjihnfjivduafhiugfvwegfciwqehi5255'
 
-  options { timestamps(); ansiColor('xterm') }
+  # Fallback to LDAP user/pass
+  NS='ldap'
+  USER='srinu'
+  PASS='bindu143'
+  # ==============================================
 
-  stages {
-    stage('Checkout & deps') {
-      steps {
-        checkout scm
-        sh '''
-          set -e
-          python3 -V
-          python3 - <<'PY'
-import sys, subprocess
-subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input", "requests"])
-PY
-        '''
-      }
+  TOKEN=\"\"
+
+  echo \"Trying MotioCI login with CAMPassport...\" >&2
+  TOKEN=\"$(python3 ci-cli.py --server=\"$MOTIO_SERVER\" --non-interactive \\
+            login --camPassportId \"$CAM_PASSPORT_ID\" || true)\"
+
+  if [ -z \"$TOKEN\" ]; then
+    echo \"CAMPassport failed; trying LDAP username/password...\" >&2
+    TOKEN=\"$(python3 ci-cli.py --server=\"$MOTIO_SERVER\" --non-interactive \\
+              login --username \"$USER\" --password \"$PASS\" --namespaceId \"$NS\" || true)\"
+  fi
+
+  test -n \"$TOKEN\" || { echo \"ERROR: MotioCI login failed (both methods).\" >&2; exit 1; }
+
+  printf \"%s\" \"$TOKEN\" > .motio_token
+  echo \"✅ MotioCI token saved to $(pwd)/.motio_token\"
+"
+'''
     }
-
-    stage('Resolve label') {
-      steps {
-        script {
-          def auto = "${env.BRANCH_NAME ?: 'devtest'}-${env.BUILD_NUMBER}"
-          env.EFFECTIVE_LABEL = params.TARGET_LABEL_NAME?.trim() ? params.TARGET_LABEL_NAME.trim() : auto
-          echo "Label to write on PRD: ${env.EFFECTIVE_LABEL}"
-        }
-      }
-    }
-
-    // 1) Login to MotioCI using PRD CAMPassport (or fallback to PRD user/pass)
-    stage('MotioCI login → token') {
-      steps {
-        sh '''
-          set -euo pipefail
-          cd MotioCI/api/CLI
-
-          TOKEN=""
-          if [ -n "${COGNOS_PRD_CAM_PASSPORT}" ]; then
-            echo "Login via PRD CAMPassport..."
-            TOKEN="$(python3 ci-cli.py --server="${MOTIO_SERVER}" --non-interactive \
-                     login --camPassportId "${COGNOS_PRD_CAM_PASSPORT}")" || true
-          fi
-
-          if [ -z "${TOKEN}" ] && [ -n "${COGNOS_PRD_USER}" ] && [ -n "${COGNOS_PRD_PASS}" ]; then
-            echo "Login via PRD username/password..."
-            TOKEN="$(python3 ci-cli.py --server="${MOTIO_SERVER}" --non-interactive \
-                     login --username "${COGNOS_PRD_USER}" --password "${COGNOS_PRD_PASS}" --namespaceId "${NAMESPACE_ID}")" || true
-          fi
-
-          test -n "${TOKEN}" || { echo "ERROR: MotioCI login failed."; exit 1; }
-          printf "%s" "${TOKEN}" > .motio_token
-          echo "Saved token → $(pwd)/.motio_token"
-        '''
-      }
-    }
-
-    // 2) Plan (local dry-run JSON; no server-side changes)
-    stage('Plan (Dry Run)') {
-      steps {
-        sh '''
-          set -euo pipefail
-          cd MotioCI/api/CLI
-          TOKEN="$(cat .motio_token)"
-
-          python3 ci-cli.py --server="${MOTIO_SERVER}" deploy \
-            --xauthtoken "${TOKEN}" \
-            --sourceInstanceName "${SRC_INSTANCE_NAME}" \
-            --searchPath '${params.SEARCH_PATHS_JSON}' \
-            --projectName "${MOTIO_PROJECT}" \
-            --targetInstanceName "${TGT_INSTANCE_NAME}" \
-            --targetLabelName "${EFFECTIVE_LABEL}" \
-            --dryRun --non-interactive > "plan-${EFFECTIVE_LABEL}.json"
-
-          ls -lh plan-*.json
-        '''
-        archiveArtifacts artifacts: 'MotioCI/api/CLI/plan-*.json', fingerprint: true
-      }
-    }
-
-    // 3) Approval & Deploy (write on PRD)
-    stage('Approval for PRD') {
-      when { expression { !params.DRY_RUN } }
-      steps { input message: "Deploy devtest → PRD as '${env.EFFECTIVE_LABEL}'?" }
-    }
-
-    stage('Deploy to PRD') {
-      when { expression { !params.DRY_RUN } }
-      steps {
-        sh '''
-          set -euo pipefail
-          cd MotioCI/api/CLI
-          TOKEN="$(cat .motio_token)"
-
-          # Prefer CAMPassport for target PRD auth; else user/pass
-          AUTH_FLAGS=""
-          if [ -n "${COGNOS_PRD_CAM_PASSPORT}" ]; then
-            AUTH_FLAGS="--camPassportId '${COGNOS_PRD_CAM_PASSPORT}'"
-          else
-            AUTH_FLAGS="--username '${COGNOS_PRD_USER}' --password '${COGNOS_PRD_PASS}' --namespaceId '${NAMESPACE_ID}'"
-          fi
-
-          eval python3 ci-cli.py --server=\\"${MOTIO_SERVER}\\" deploy \
-            --xauthtoken \\"${TOKEN}\\" \
-            --sourceInstanceName \\"${SRC_INSTANCE_NAME}\\" \
-            --searchPath '${params.SEARCH_PATHS_JSON}' \
-            --projectName \\"${MOTIO_PROJECT}\\" \
-            --targetInstanceName \\"${TGT_INSTANCE_NAME}\\" \
-            --targetLabelName \\"${EFFECTIVE_LABEL}\\" \
-            --non-interactive ${AUTH_FLAGS} | tee "deploy-${EFFECTIVE_LABEL}.log"
-
-          ls -lh deploy-*.log
-        '''
-        archiveArtifacts artifacts: 'MotioCI/api/CLI/deploy-*.log', fingerprint: true
-      }
-    }
-  }
-
-  post {
-    success { echo "✅ Done: read from devtest, wrote to PRD as '${env.EFFECTIVE_LABEL}'" }
-    failure { echo "❌ Failed. Check CAMPassport/credentials or namespace (${env.NAMESPACE_ID})." }
   }
 }
