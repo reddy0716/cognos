@@ -1,33 +1,40 @@
-stage('MotioCI Login (safe)') {
+stage('MotioCI Login (fixed)') {
   steps {
     withCredentials([file(credentialsId: 'cognos-credentials-json', variable: 'CREDENTIALS_FILE')]) {
       dir('MotioCI/api/CLI') {
-        // install once
+        // install deps (no interpolation here)
         sh 'python3 -m pip install --user -r requirements.txt'
 
         script {
-          // No Groovy interpolation; shell expands $MOTIO_SERVER and $CREDENTIALS_FILE
-          def raw = sh(
+          // Run login: capture BOTH stdout+stderr to a file, then parse safely
+          def token = sh(
             script: '''
               set -euo pipefail
+              : > login.out
+              # Login (merge stderr into stdout so we can parse the whole output)
               python3 ci-cli.py --server="$MOTIO_SERVER" login --credentialsFile "$CREDENTIALS_FILE" \
-                | awk -F': ' '/^Auth Token/{print $2}'
+                >login.out 2>&1 || true
+
+              # Extract the token line, then strip the label
+              # Accept variants like "Auth Token:" or "Auth token:"
+              grep -iE '^Auth[[:space:]]+Token:' login.out | sed -e 's/^[^:]*:[[:space:]]*//' > login.token || true
+              cat login.token
             ''',
             returnStdout: true
           ).trim()
 
-          if (!raw) {
-            // Helpful diag without leaking secrets
+          if (!token) {
+            // Show non-sensitive diagnostics if parsing failed
             sh '''
               set -e
-              echo "DEBUG: printing login help for diagnostics:"
-              python3 ci-cli.py --help || true
-              python3 ci-cli.py login --help || true
+              echo "------ MotioCI login output (sanitized) ------"
+              sed 's/"password":[^,}]*/"password":"***"/g' login.out || true
+              echo "------------------------------------------------"
             '''
-            error 'MotioCI login failed: token not returned'
+            error 'MotioCI login failed: token not returned (check output above).'
           }
 
-          env.MOTIO_AUTH_TOKEN = raw
+          env.MOTIO_AUTH_TOKEN = token
           echo "MotioCI login OK (token length: ${env.MOTIO_AUTH_TOKEN.length()})"
         }
       }
