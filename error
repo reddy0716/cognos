@@ -1,18 +1,18 @@
-stage('Login to MotioCI') {
+stage('Dummy Deploy from DevTest to Prod') {
   steps {
     container('python') {
       script {
-        env.MOTIO_AUTH_TOKEN = sh(
-          script: """
-            cd MotioCI/api/CLI
-            python3 ci-cli.py --server="${MOTIO_CI_URL}" login \
-              --credentials '[{"namespaceId":"AzureAD","camPassportId":"${env.DEVTEST_PASSPORT}","instanceId":"1"},{"namespaceId":"AzureAD","camPassportId":"${env.PROD_PASSPORT}","instanceId":"2"}]' \
-              | grep "x-auth_token" | awk '{print \$2}'
-          """,
-          returnStdout: true
-        ).trim()
-
-        echo "Captured MotioCI x-auth-token: ${env.MOTIO_AUTH_TOKEN.take(15)}..."
+        sh """
+          cd MotioCI/api/CLI
+          python3 ci-cli.py --server="${MOTIO_CI_URL}" deploy \
+            --xauthtoken=${env.MOTIO_AUTH_TOKEN} \
+            --sourceInstanceName="Cognos-DEV/TEST" \
+            --targetInstanceName="Cognos-PRD" \
+            --projectName="Demo" \
+            --targetLabelName="DummyDeployLabel" \
+            --searchPath "/content/folder[@name='Motio Samples']" \
+            --camPassportId="${env.PROD_PASSPORT}"
+        """
       }
     }
   }
