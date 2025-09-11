@@ -1,234 +1,35 @@
-#!/usr/bin/env python3
-import requests
-import json
-import os
-import logging
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
+stage('Get camPassportIds') {
+  steps {
+    container('python') {
+      script {
+        env.DEVTEST_PASSPORT = sh(
+          script: """
+            cd MotioCI/api/CLI
+            python3 session.py ${DEVTEST_URL} --credentialsFile devtest-credentials.json
+          """,
+          returnStdout: true
+        ).trim()
 
-# Disable SSL warnings since we're using -k (insecure) flag equivalent
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+        env.PROD_PASSPORT = sh(
+          script: """
+            cd MotioCI/api/CLI
+            python3 session.py ${PROD_URL} --credentialsFile prod-credentials.json
+          """,
+          returnStdout: true
+        ).trim()
 
-def get_cam_passport_id(cognos_url, credentials=None, credentials_file=None):
-    """
-    Connect to Cognos and extract camPassportId or API session key.
-
-    Args:
-        cognos_url (str): The URL of the Cognos instance (e.g. https://mycognos/bi)
-        credentials (dict or str, optional): Dictionary or JSON string with login credentials
-        credentials_file (str, optional): Path to credentials file
-
-    Returns:
-        str: The camPassportId or CAM session key if found, None otherwise
-    """
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-    # Load credentials from file if specified
-    if credentials_file and not credentials:
-        try:
-            if not os.path.exists(credentials_file):
-                logging.error(f"Credentials file '{credentials_file}' not found!")
-                return None
-
-            with open(credentials_file, 'r') as file:
-                credentials_data = json.load(file)
-                logging.info(f"Successfully loaded credentials from {credentials_file}")
-                credentials = credentials_data
-        except Exception as e:
-            logging.error(f"Error loading credentials file: {e}")
-            return None
-
-    # Parse credentials if provided as a JSON string
-    if isinstance(credentials, str):
-        try:
-            credentials = json.loads(credentials)
-        except json.JSONDecodeError as e:
-            logging.error(f"Error parsing credentials JSON: {e}")
-            return None
-
-    # Initialize session
-    session = requests.Session()
-
-    # Process credentials for Cognos format (extract from array if needed)
-    if isinstance(credentials, list) and len(credentials) > 0:
-        creds = credentials[0]  # Use first credential in list
-    else:
-        creds = credentials
-
-    try:
-        # --- API KEY AUTHENTICATION ---
-        if creds and "apikey" in creds:
-            try:
-                logging.info("Attempting Cognos API login with API key...")
-                base_url = cognos_url.rstrip("/") + "/v1/session"
-                payload = {
-                    "parameters": [
-                        {"name": "CAMAPILoginKey", "value": creds["apikey"]}
-                    ]
-                }
-
-                response = session.put(
-                    base_url,
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                    verify=False,
-                    allow_redirects=True
-                )
-
-                logging.info(f"API key login response: {response.status_code}")
-
-                if response.status_code == 200:
-                    data = response.json()
-                    session_key = data.get("session_key")
-                    if session_key:
-                        passport_id = "CAM " + session_key if not session_key.startswith("CAM") else session_key
-                        logging.info(f"Retrieved camPassportId from API key: {passport_id[:15]}...")
-                        return passport_id
-                else:
-                    logging.error(f"API key login failed: {response.text}")
-
-            except Exception as e:
-                logging.error(f"API key login error: {e}")
-                return None
-
-        # --- EXISTING USERNAME/PASSWORD FLOW ---
-        # Initial GET
-        logging.info(f"Making initial connection to Cognos: {cognos_url}")
-        response = session.get(cognos_url, verify=False, allow_redirects=True)
-
-        passport_id = check_for_passport_id(session, response)
-        if passport_id:
-            return passport_id
-
-        # If no passport found, try authentication with creds
-        if creds:
-            logging.info("No passport found in initial request, attempting user/password authentication...")
-
-            login_endpoints = [
-                "/bi/v1/login",
-                "/bi/v1/disp",
-                "/bi/?b_action=xts.run&m=portal/login.xts",
-                "/bi/login",
-                "/ibmcognos/bi/v1/login",
-                "/api/login"
-            ]
-
-            for endpoint in login_endpoints:
-                try:
-                    login_url = cognos_url
-                    if not any(cognos_url.endswith(ep) for ep in login_endpoints):
-                        base_url = cognos_url.split("?")[0].rstrip("/")
-                        login_url = f"{base_url}{endpoint}"
-
-                    logging.info(f"Attempting login at: {login_url}")
-
-                    auth_data = {}
-                    if "username" in creds and "password" in creds:
-                        auth_data = {
-                            "username": creds["username"],
-                            "password": creds["password"]
-                        }
-                        if "namespace" in creds:
-                            auth_data["namespace"] = creds["namespace"]
-
-                    if not auth_data:
-                        auth_data = creds
-
-                    login_response = session.post(
-                        login_url,
-                        json=auth_data,
-                        headers={"Content-Type": "application/json"},
-                        verify=False,
-                        allow_redirects=True
-                    )
-
-                    logging.info(f"Login response status: {login_response.status_code}")
-
-                    if login_response.status_code < 400:
-                        passport_id = check_for_passport_id(session, login_response)
-                        if passport_id:
-                            return passport_id
-
-                except requests.exceptions.RequestException as e:
-                    logging.warning(f"Login attempt failed at {login_url}: {e}")
-                    continue
-
-            logging.error("Authentication failed with all known endpoints")
-            return None
-
-        return None
-
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error connecting to Cognos: {e}")
-        return None
-
-
-def check_for_passport_id(session, response):
-    """Check for passport ID in cookies and response headers/content"""
-    for cookie in session.cookies:
-        if 'passport' in cookie.name.lower():
-            passport_id = cookie.value
-            logging.info(f"Found {cookie.name}: {passport_id[:10]}...")
-            return passport_id
-
-    if 'Location' in response.headers:
-        redirect_url = response.headers['Location']
-        if 'cmpassport=' in redirect_url.lower():
-            passport_id = redirect_url.split('cmpassport=')[1].split('&')[0]
-            logging.info(f"Found passport in redirect: {passport_id[:10]}...")
-            return passport_id
-
-    try:
-        content_type = response.headers.get('Content-Type', '')
-        if 'json' in content_type:
-            data = response.json()
-            if 'camPassportId' in data:
-                passport_id = data['camPassportId']
-                logging.info(f"Found passport in JSON response: {passport_id[:10]}...")
-                return passport_id
-    except Exception:
-        pass
-
-    try:
-        text = response.text
-        if 'passport' in text.lower():
-            import re
-            match = re.search(r'["\']?cm:passport["\']?\s*[:=]\s*["\']([^"\']+)["\']', text)
-            if match:
-                passport_id = match.group(1)
-                logging.info(f"Found passport in response text: {passport_id[:10]}...")
-                return passport_id
-    except Exception:
-        pass
-
-    return None
-
-
-def mask_sensitive_data(data):
-    """Mask sensitive data for logging purposes"""
-    if isinstance(data, list):
-        return [mask_sensitive_data(item) for item in data]
-    elif isinstance(data, dict):
-        masked = {}
-        for key, value in data.items():
-            if key.lower() in ['apikey', 'password', 'token', 'secret', 'key']:
-                masked[key] = '*' * 8
-            else:
-                masked[key] = value
-        return masked
-    return data
-
-
-def get_cognos_session_for_deployment(cognos_url, credentials=None, credentials_file=None):
-    """
-    Get Cognos session information suitable for MotioCI deployment.
-
-    Returns:
-        dict: Dictionary with authentication information including camPassportId
-    """
-    passport_id = get_cam_passport_id(cognos_url, credentials, credentials_file)
-
-    if passport_id:
-        return {
-            'camPassportId': passport_id
+        if (!env.DEVTEST_PASSPORT) {
+          error("❌ DevTest camPassportId is empty! Check devtest-credentials.json or API key.")
+        } else {
+          echo "✅ DevTest camPassportId captured: ${env.DEVTEST_PASSPORT.take(15)}..."
         }
-    return None
+
+        if (!env.PROD_PASSPORT) {
+          error("❌ Prod camPassportId is empty! Check prod-credentials.json or API key.")
+        } else {
+          echo "✅ Prod camPassportId captured: ${env.PROD_PASSPORT.take(15)}..."
+        }
+      }
+    }
+  }
+}
