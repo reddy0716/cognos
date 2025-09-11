@@ -11,7 +11,8 @@ stage('Login to MotioCI') {
           """,
           returnStdout: true
         ).trim()
-        echo "Captured MotioCI x-auth-token: ${env.MOTIO_AUTH_TOKEN.take(12)}..."
+
+        echo "Captured MotioCI x-auth-token: ${env.MOTIO_AUTH_TOKEN.take(15)}..."
       }
     }
   }
