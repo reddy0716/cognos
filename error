@@ -1,19 +1,17 @@
-stage('Get camPassportIds') {
+stage('Login to MotioCI') {
   steps {
     container('python') {
       script {
-        env.DEVTEST_PASSPORT = sh(
-          script: "python3 session.py ${DEVTEST_URL} --credentialsFile devtest-credentials.json",
+        env.MOTIO_AUTH_TOKEN = sh(
+          script: """
+            cd MotioCI/api/CLI
+            python3 ci-cli.py --server="${MOTIO_CI_URL}" login \
+              --credentials '[{"namespaceId":"AzureAD","camPassportId":"${env.DEVTEST_PASSPORT}","instanceId":"1"},{"namespaceId":"AzureAD","camPassportId":"${env.PROD_PASSPORT}","instanceId":"2"}]' \
+              | grep "x-auth_token" | awk '{print \$2}'
+          """,
           returnStdout: true
         ).trim()
-
-        env.PROD_PASSPORT = sh(
-          script: "python3 session.py ${PROD_URL} --credentialsFile prod-credentials.json",
-          returnStdout: true
-        ).trim()
-
-        echo "DevTest camPassportId: ${env.DEVTEST_PASSPORT.take(10)}..."
-        echo "Prod camPassportId: ${env.PROD_PASSPORT.take(10)}..."
+        echo "Captured MotioCI x-auth-token: ${env.MOTIO_AUTH_TOKEN.take(12)}..."
       }
     }
   }
