@@ -1,34 +1,34 @@
-stage('Get camPassportIds') {
+stage('MotioCI Login Debug') {
   steps {
     container('python') {
       script {
-        env.DEVTEST_PASSPORT = sh(
-          script: """
-            cd MotioCI/api/CLI
-            python3 session.py ${DEVTEST_URL} --credentialsFile devtest-credentials.json
-          """,
-          returnStdout: true
-        ).trim()
+        sh '''
+set -euo pipefail
+cd MotioCI/api/CLI
 
-        env.PROD_PASSPORT = sh(
-          script: """
-            cd MotioCI/api/CLI
-            python3 session.py ${PROD_URL} --credentialsFile prod-credentials.json
-          """,
-          returnStdout: true
-        ).trim()
+cat > creds.json <<ENDJSON
+[
+  {
+    "instanceId": "3",
+    "namespaceId": "AzureAD",
+    "username": "devtest_user",
+    "password": "devtest_pass"
+  },
+  {
+    "instanceId": "1",
+    "namespaceId": "AzureAD",
+    "username": "prd_user",
+    "password": "prd_pass"
+  }
+]
+ENDJSON
 
-        if (!env.DEVTEST_PASSPORT) {
-          error("❌ DevTest camPassportId is empty! Check devtest-credentials.json or API key.")
-        } else {
-          echo "✅ DevTest camPassportId captured: ${env.DEVTEST_PASSPORT.take(15)}..."
-        }
+echo "=== creds.json ==="
+sed -E 's/"password":[^,}]*/"password":"***"/g' creds.json
 
-        if (!env.PROD_PASSPORT) {
-          error("❌ Prod camPassportId is empty! Check prod-credentials.json or API key.")
-        } else {
-          echo "✅ Prod camPassportId captured: ${env.PROD_PASSPORT.take(15)}..."
-        }
+echo "=== Running MotioCI login (debug) ==="
+python3 ci-cli.py --server="$MOTIO_SERVER" login --credentialsFile creds.json || true
+        '''
       }
     }
   }
