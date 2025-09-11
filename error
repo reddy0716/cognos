@@ -1,35 +1,79 @@
-stage('MotioCI Login Debug') {
+stage('Auth: Cognos API sessions (Prod + DevTest)') {
   steps {
     container('python') {
-      script {
+      withCredentials([
+        string(credentialsId: 'cognos-api-key-prd', variable: 'COGNOS_API_KEY_PRD'),
+        string(credentialsId: 'cognos-api-key-dev', variable: 'COGNOS_API_KEY_DEV')
+      ]) {
         sh '''
-set -euo pipefail
-cd MotioCI/api/CLI
+          set -eu
+          (set -o pipefail) 2>/dev/null || true
 
-cat > creds.json <<ENDJSON
-[
-  {
-    "instanceId": "3",
-    "namespaceId": "AzureAD",
-    "username": "devtest_user",
-    "password": "devtest_pass"
-  },
-  {
-    "instanceId": "1",
-    "namespaceId": "AzureAD",
-    "username": "prd_user",
-    "password": "prd_pass"
-  }
-]
-ENDJSON
+          echo "Installing MotioCI CLI dependencies..."
+          cd MotioCI/api/CLI
+          python3 -m pip install --user -r requirements.txt
+          cd - >/dev/null
 
-echo "=== creds.json ==="
-sed -E 's/"password":[^,}]*/"password":"***"/g' creds.json
+          mkdir -p MotioCI/api
 
-echo "=== Running MotioCI login (debug) ==="
-python3 ci-cli.py --server="$MOTIO_SERVER" login --credentialsFile creds.json || true
+          start_session () {
+            local BASE="$1/v1"
+            local API_KEY="$2"
+            local PREFIX="$3"
+
+            echo "Starting Cognos API session ($PREFIX)..."
+
+            rm -f login.json session.json headers.txt cookies.txt || true
+
+            cat > login.json <<JSON
+{ "parameters": [ { "name": "CAMAPILoginKey", "value": "${API_KEY}" } ] }
+JSON
+
+            # Step 1: PUT /session with API key
+            curl --fail-with-body -sS -X PUT "$BASE/session" \
+              -H "Content-Type: application/json" \
+              -d @login.json \
+              -c cookies.txt -b cookies.txt \
+              -D headers.txt -o session.json
+
+            SESSION_KEY=$(python3 -c 'import json; print(json.load(open("session.json")).get("session_key",""))')
+            if [ -z "$SESSION_KEY" ]; then
+              echo "ERROR: No session_key returned from $PREFIX Cognos." >&2
+              echo "Response body:"; cat session.json || true
+              exit 1
+            fi
+
+            # Build IBM-BA-Authorization header safely
+            case "$SESSION_KEY" in
+              "CAM "*) AUTH_VALUE="$SESSION_KEY" ;;
+              "CAM"*)  AUTH_VALUE="$SESSION_KEY" ;;
+              *)       AUTH_VALUE="CAM $SESSION_KEY" ;;
+            esac
+
+            echo "✅ $PREFIX Cognos API session verified."
+
+            # Persist into env file for Jenkins
+            printf "${PREFIX}_CAMPASSPORT='%s'\n" "$AUTH_VALUE" >> MotioCI/api/motio_env
+          }
+
+          # Run sessions for both DevTest and Prod
+          start_session "$COGNOS_API_BASE_DEV" "$COGNOS_API_KEY_DEV" "DEVTEST"
+          start_session "$COGNOS_API_BASE_PRD" "$COGNOS_API_KEY_PRD" "PROD"
         '''
       }
     }
+    script {
+      def envFile = readFile('MotioCI/api/motio_env').trim()
+      envFile.split("\n").each { line ->
+        def (k,v) = line.split('=', 2)
+        if (v.startsWith("'") && v.endsWith("'") && v.length() >= 2) {
+          v = v.substring(1, v.length()-1)
+        }
+        env[k] = v
+      }
+      echo "✅ Captured DevTest Passport: ${env.DEVTEST_CAMPASSPORT.take(15)}..."
+      echo "✅ Captured Prod Passport: ${env.PROD_CAMPASSPORT.take(15)}..."
+    }
+    archiveArtifacts artifacts: 'MotioCI/api/motio_env, session.json, headers.txt, cookies.txt', onlyIfSuccessful: false
   }
 }
