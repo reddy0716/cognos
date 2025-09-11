@@ -1,0 +1,16 @@
+stage('Get camPassportIds') {
+      steps {
+        container('python') {
+          script {
+            sh '''
+              python session.py "${DEVTEST_URL}" --credentialsFile devtest-credentials.json > devtest_passport.txt
+              python session.py "${PROD_URL}" --credentialsFile prod-credentials.json > prod_passport.txt
+            '''
+            env.DEVTEST_PASSPORT = sh(script: "cat devtest_passport.txt", returnStdout: true).trim()
+            env.PROD_PASSPORT    = sh(script: "cat prod_passport.txt", returnStdout: true).trim()
+            echo "DevTest camPassportId: ${env.DEVTEST_PASSPORT.take(10)}..."
+            echo "Prod camPassportId: ${env.PROD_PASSPORT.take(10)}..."
+          }
+        }
+      }
+    }
