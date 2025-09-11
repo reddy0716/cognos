@@ -22,7 +22,7 @@ pipeline {
     COGNOS_API_BASE_PRD = "https://dhcsprodcog.ca.analytics.ibm.com/bi"
 
     COGNOS_NAMESPACE   = "AzureAD"
-    SOURCE_INSTANCE_ID = "3"   // DevTest instance ID in MotioCI
+    SOURCE_INSTANCE_ID = "3"   // Dev/Test instance ID in MotioCI
     TARGET_INSTANCE_ID = "1"   // Prod instance ID in MotioCI
     PROJECT_NAME       = "Demo"
   }
