@@ -1,8 +1,20 @@
-[
-  {
-    "namespaceId": "AzureAD",
-    "username": "devtest_user",
-    "password": "devtest_password",
-    "instanceId": "1"
+stage('Get camPassportIds') {
+  steps {
+    container('python') {
+      script {
+        env.DEVTEST_PASSPORT = sh(
+          script: "python3 session.py ${DEVTEST_URL} --credentialsFile devtest-credentials.json",
+          returnStdout: true
+        ).trim()
+
+        env.PROD_PASSPORT = sh(
+          script: "python3 session.py ${PROD_URL} --credentialsFile prod-credentials.json",
+          returnStdout: true
+        ).trim()
+
+        echo "DevTest camPassportId: ${env.DEVTEST_PASSPORT.take(10)}..."
+        echo "Prod camPassportId: ${env.PROD_PASSPORT.take(10)}..."
+      }
+    }
   }
-]
+}
