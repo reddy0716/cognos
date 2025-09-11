@@ -1,18 +1,16 @@
-stage('Dummy Deploy from DevTest to Prod') {
+stage('Check camPassportIds') {
   steps {
-    container('python') {
-      script {
-        sh """
-          cd MotioCI/api/CLI
-          python3 ci-cli.py --server="${MOTIO_CI_URL}" deploy \
-            --xauthtoken=${env.MOTIO_AUTH_TOKEN} \
-            --sourceInstanceName="Cognos-DEV/TEST" \
-            --targetInstanceName="Cognos-PRD" \
-            --projectName="Demo" \
-            --targetLabelName="DummyDeployLabel" \
-            --searchPath "/content/folder[@name='Motio Samples']" \
-            --camPassportId="${env.PROD_PASSPORT}"
-        """
+    script {
+      if (env.DEVTEST_PASSPORT?.trim()) {
+        echo "DevTest camPassportId found: ${env.DEVTEST_PASSPORT.take(15)}..."
+      } else {
+        error("DevTest camPassportId is empty!")
+      }
+
+      if (env.PROD_PASSPORT?.trim()) {
+        echo "Prod camPassportId found: ${env.PROD_PASSPORT.take(15)}..."
+      } else {
+        error("Prod camPassportId is empty!")
       }
     }
   }
