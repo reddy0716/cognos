@@ -1,79 +1,155 @@
-stage('Auth: Cognos API sessions (Prod + DevTest)') {
-  steps {
-    container('python') {
-      withCredentials([
-        string(credentialsId: 'cognos-api-key-prd', variable: 'COGNOS_API_KEY_PRD'),
-        string(credentialsId: 'cognos-api-key-dev', variable: 'COGNOS_API_KEY_DEV')
-      ]) {
-        sh '''
-          set -eu
-          (set -o pipefail) 2>/dev/null || true
+    // MotioCI server
+    COGNOS_SERVER_URL  = "https://cgrptmcip01.cloud.cammis.ca.gov"
 
-          echo "Installing MotioCI CLI dependencies..."
-          cd MotioCI/api/CLI
-          python3 -m pip install --user -r requirements.txt
-          cd - >/dev/null
+    // Cognos API bases (fix: use /bi, not /api to avoid 404)
+    COGNOS_API_BASE_DEV = "https://dhcsdevtestcog.ca.analytics.ibm.com/bi"
+    COGNOS_API_BASE_PRD = "https://dhcsprodcognos.ca.analytics.ibm.com/bi"
 
-          mkdir -p MotioCI/api
+    // Cognos namespace + instance IDs in MotioCI
+    COGNOS_NAMESPACE   = "AzureAD"
+    SOURCE_INSTANCE_ID = "3"
+    TARGET_INSTANCE_ID = "1"
+    PROJECT_NAME       = "Demo"
+  }
 
-          start_session () {
-            local BASE="$1/v1"
-            local API_KEY="$2"
-            local PREFIX="$3"
+  options {
+    disableConcurrentBuilds()
+    timestamps()
+  }
 
-            echo "Starting Cognos API session ($PREFIX)..."
+  stages {
+    stage("initialize") {
+      steps {
+        script {
+          echo "Branch: ${env.GIT_BRANCH}"
+          echo "MotioCI Server: ${env.COGNOS_SERVER_URL}"
+          echo "DevTest Cognos Base: ${env.COGNOS_API_BASE_DEV}"
+          echo "Prod Cognos Base: ${env.COGNOS_API_BASE_PRD}"
+        }
+      }
+    }
 
-            rm -f login.json session.json headers.txt cookies.txt || true
+    stage('Check Python Availability') {
+      steps {
+        container('python') {
+          sh '''
+            set -e
+            echo "Checking for Python3..."
+            which python3 || true
+            python3 --version || true
+          '''
+        }
+      }
+    }
 
-            cat > login.json <<JSON
-{ "parameters": [ { "name": "CAMAPILoginKey", "value": "${API_KEY}" } ] }
+    // === New Stage: DevTest Passport ===
+    stage('Auth: Cognos API session (DEVTEST)') {
+      steps {
+        container('python') {
+          withCredentials([string(credentialsId: 'cognos-api-key-dev', variable: 'COGNOS_API_KEY_DEV')]) {
+            sh '''
+              set -eu
+              (set -o pipefail) 2>/dev/null || true
+
+              echo "Starting Cognos API session (DEVTEST)..."
+              BASE="${COGNOS_API_BASE_DEV}/v1"
+
+              rm -f login.json session.json headers.txt cookies.txt || true
+              mkdir -p MotioCI/api
+
+              cat > login.json <<JSON
+{ "parameters": [ { "name": "CAMAPILoginKey", "value": "${COGNOS_API_KEY_DEV}" } ] }
 JSON
 
-            # Step 1: PUT /session with API key
-            curl --fail-with-body -sS -X PUT "$BASE/session" \
-              -H "Content-Type: application/json" \
-              -d @login.json \
-              -c cookies.txt -b cookies.txt \
-              -D headers.txt -o session.json
+              curl --fail-with-body -sS -X PUT "$BASE/session" \
+                   -H "Content-Type: application/json" \
+                   -d @login.json \
+                   -c cookies.txt -b cookies.txt \
+                   -D headers.txt -o session.json
 
-            SESSION_KEY=$(python3 -c 'import json; print(json.load(open("session.json")).get("session_key",""))')
-            if [ -z "$SESSION_KEY" ]; then
-              echo "ERROR: No session_key returned from $PREFIX Cognos." >&2
-              echo "Response body:"; cat session.json || true
-              exit 1
-            fi
+              SESSION_KEY=$(python3 -c 'import json; print(json.load(open("session.json")).get("session_key",""))')
+              if [ -z "$SESSION_KEY" ]; then
+                echo "ERROR: No session_key from DEVTEST Cognos."
+                cat session.json || true
+                exit 1
+              fi
 
-            # Build IBM-BA-Authorization header safely
-            case "$SESSION_KEY" in
-              "CAM "*) AUTH_VALUE="$SESSION_KEY" ;;
-              "CAM"*)  AUTH_VALUE="$SESSION_KEY" ;;
-              *)       AUTH_VALUE="CAM $SESSION_KEY" ;;
-            esac
+              case "$SESSION_KEY" in
+                "CAM "*) AUTH_VALUE="$SESSION_KEY" ;;
+                "CAM"*)  AUTH_VALUE="$SESSION_KEY" ;;
+                *)       AUTH_VALUE="CAM $SESSION_KEY" ;;
+              esac
 
-            echo "✅ $PREFIX Cognos API session verified."
-
-            # Persist into env file for Jenkins
-            printf "${PREFIX}_CAMPASSPORT='%s'\n" "$AUTH_VALUE" >> MotioCI/api/motio_env
+              echo "Cognos API session verified for DEVTEST."
+              printf "DEVTEST_CAMPASSPORT='%s'\n" "$AUTH_VALUE" > MotioCI/api/motio_env_dev
+            '''
           }
-
-          # Run sessions for both DevTest and Prod
-          start_session "$COGNOS_API_BASE_DEV" "$COGNOS_API_KEY_DEV" "DEVTEST"
-          start_session "$COGNOS_API_BASE_PRD" "$COGNOS_API_KEY_PRD" "PROD"
-        '''
-      }
-    }
-    script {
-      def envFile = readFile('MotioCI/api/motio_env').trim()
-      envFile.split("\n").each { line ->
-        def (k,v) = line.split('=', 2)
-        if (v.startsWith("'") && v.endsWith("'") && v.length() >= 2) {
-          v = v.substring(1, v.length()-1)
         }
-        env[k] = v
+        script {
+          def envFile = readFile('MotioCI/api/motio_env_dev').trim()
+          envFile.split("\n").each { line ->
+            def (k,v) = line.split('=', 2)
+            if (v.startsWith("'") && v.endsWith("'")) { v = v.substring(1, v.length()-1) }
+            env[k] = v
+          }
+          echo "Captured DevTest Passport: ${env.DEVTEST_CAMPASSPORT.take(15)}..."
+        }
       }
-      echo "✅ Captured DevTest Passport: ${env.DEVTEST_CAMPASSPORT.take(15)}..."
-      echo "✅ Captured Prod Passport: ${env.PROD_CAMPASSPORT.take(15)}..."
     }
-    archiveArtifacts artifacts: 'MotioCI/api/motio_env, session.json, headers.txt, cookies.txt', onlyIfSuccessful: false
+
+    // === New Stage: Prod Passport ===
+    stage('Auth: Cognos API session (PROD)') {
+      steps {
+        container('python') {
+          withCredentials([string(credentialsId: 'cognos-api-key-prd', variable: 'COGNOS_API_KEY_PRD')]) {
+            sh '''
+              set -eu
+              (set -o pipefail) 2>/dev/null || true
+
+              echo "Starting Cognos API session (PROD)..."
+              BASE="${COGNOS_API_BASE_PRD}/v1"
+
+              rm -f login.json session.json headers.txt cookies.txt || true
+              mkdir -p MotioCI/api
+
+              cat > login.json <<JSON
+{ "parameters": [ { "name": "CAMAPILoginKey", "value": "${COGNOS_API_KEY_PRD}" } ] }
+JSON
+
+              curl --fail-with-body -sS -X PUT "$BASE/session" \
+                   -H "Content-Type: application/json" \
+                   -d @login.json \
+                   -c cookies.txt -b cookies.txt \
+                   -D headers.txt -o session.json
+
+              SESSION_KEY=$(python3 -c 'import json; print(json.load(open("session.json")).get("session_key",""))')
+              if [ -z "$SESSION_KEY" ]; then
+                echo "ERROR: No session_key from PROD Cognos."
+                cat session.json || true
+                exit 1
+              fi
+
+              case "$SESSION_KEY" in
+                "CAM "*) AUTH_VALUE="$SESSION_KEY" ;;
+                "CAM"*)  AUTH_VALUE="$SESSION_KEY" ;;
+                *)       AUTH_VALUE="CAM $SESSION_KEY" ;;
+              esac
+
+              echo "Cognos API session verified for PROD."
+              printf "PROD_CAMPASSPORT='%s'\n" "$AUTH_VALUE" > MotioCI/api/motio_env_prod
+            '''
+          }
+        }
+        script {
+          def envFile = readFile('MotioCI/api/motio_env_prod').trim()
+          envFile.split("\n").each { line ->
+            def (k,v) = line.split('=', 2)
+            if (v.startsWith("'") && v.endsWith("'")) { v = v.substring(1, v.length()-1) }
+            env[k] = v
+          }
+          echo "Captured Prod Passport: ${env.PROD_CAMPASSPORT.take(15)}..."
+        }
+      }
+    }
   }
 }
