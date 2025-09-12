@@ -1,17 +1,30 @@
-script {
-  env.MOTIO_AUTH_TOKEN = sh(
-    script: """
-      cd MotioCI/api/CLI
-      python3 ci-cli.py --server="${MOTIO_CI_URL}" login \
-        --credentials '[{"namespaceId":"${COGNOS_NAMESPACE}","camPassportId":"${env.DEVTEST_CAMPASSPORT}","instanceId":"${SOURCE_INSTANCE_ID}"},{"namespaceId":"${COGNOS_NAMESPACE}","camPassportId":"${env.PROD_CAMPASSPORT}","instanceId":"${TARGET_INSTANCE_ID}"}]' \
-        | grep "x-auth_token" | cut -d: -f2 | tr -d ' '
-    """,
-    returnStdout: true
-  ).trim()
+stage('Login to MotioCI') {
+  steps {
+    container('python') {
+      script {
+        def rawOutput = sh(
+          script: """
+            cd MotioCI/api/CLI
+            python3 ci-cli.py --server="${MOTIO_CI_URL}" login \
+              --credentials '[{"namespaceId":"${COGNOS_NAMESPACE}","camPassportId":"${env.DEVTEST_CAMPASSPORT}","instanceId":"${SOURCE_INSTANCE_ID}"},{"namespaceId":"${COGNOS_NAMESPACE}","camPassportId":"${env.PROD_CAMPASSPORT}","instanceId":"${TARGET_INSTANCE_ID}"}]'
+          """,
+          returnStdout: true
+        ).trim()
 
-  if (!env.MOTIO_AUTH_TOKEN?.trim()) {
-    error("❌ MotioCI auth token is EMPTY!")
+        echo "==== Raw MotioCI login output ===="
+        echo rawOutput
+        echo "================================="
+
+        // Try to extract the token if it's printed like "x-auth_token: abc123"
+        def matcher = rawOutput =~ /x-auth[_-]token[:=]\s*([A-Za-z0-9\-]+)/
+
+        if (matcher) {
+          env.MOTIO_AUTH_TOKEN = matcher[0][1]
+          echo "✅ Captured MotioCI x-auth-token: ${env.MOTIO_AUTH_TOKEN.take(15)}..."
+        } else {
+          error("❌ No x-auth-token found in MotioCI login output!")
+        }
+      }
+    }
   }
-
-  echo "✅ Captured MotioCI x-auth-token: ${env.MOTIO_AUTH_TOKEN.take(15)}..."
 }
