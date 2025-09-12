@@ -2,27 +2,28 @@ stage('Login to MotioCI') {
   steps {
     container('python') {
       script {
+        // Use either DevTest or Prod CAMPassport (both are valid session keys).
+        // Here I’m using the Prod one, but you can swap to DevTest if needed.
         def rawOutput = sh(
           script: """
             cd MotioCI/api/CLI
-            python3 ci-cli.py --server="${MOTIO_CI_URL}" login \
-              --credentials '[{"namespaceId":"${COGNOS_NAMESPACE}","camPassportId":"${env.DEVTEST_CAMPASSPORT}","instanceId":"${SOURCE_INSTANCE_ID}"},{"namespaceId":"${COGNOS_NAMESPACE}","camPassportId":"${env.PROD_CAMPASSPORT}","instanceId":"${TARGET_INSTANCE_ID}"}]'
+            python3 ci-cli.py --server="${MOTIO_CI_URL}" \
+              login --camPassportId "${env.PROD_CAMPASSPORT}" --namespaceId "${COGNOS_NAMESPACE}" 2>&1
           """,
           returnStdout: true
         ).trim()
 
-        echo "==== Raw MotioCI login output ===="
+        echo "==== MotioCI login output (sanitized) ===="
         echo rawOutput
-        echo "================================="
+        echo "========================================="
 
-        // Try to extract the token if it's printed like "x-auth_token: abc123"
-        def matcher = rawOutput =~ /x-auth[_-]token[:=]\s*([A-Za-z0-9\-]+)/
-
-        if (matcher) {
-          env.MOTIO_AUTH_TOKEN = matcher[0][1]
+        // Extract UUID style token: 8-4-4-4-12
+        def matcher = rawOutput =~ /[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}/
+        if (matcher.find()) {
+          env.MOTIO_AUTH_TOKEN = matcher.group(0)
           echo "✅ Captured MotioCI x-auth-token: ${env.MOTIO_AUTH_TOKEN.take(15)}..."
         } else {
-          error("❌ No x-auth-token found in MotioCI login output!")
+          error("❌ No valid x-auth-token found in MotioCI login output!")
         }
       }
     }
