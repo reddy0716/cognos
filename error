@@ -1,5 +1,4 @@
-CAMPASSPORT=$(curl -sk -X POST "$SERVER/graphql" \
+SESSION_KEY=$(curl -sk -X PUT "https://dhcsprodcognos.ca.analytics.ibm.com/api/v1/session" \
   -H "Content-Type: application/json" \
-  -H "x-auth-token: $XAUTHTOKEN" \
-  -d '{"query":"query { loginTokens { camPassport } }"}' \
-  | grep -oP '(?<=\"camPassport\":\")[^"]+')
+  -d '{"parameters":[{"name":"CAMAPILoginKey","value":"<YOUR_API_KEY>"}]}' \
+  | grep -oP '(?<="session_key":")[^"]+')
