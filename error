@@ -1,3 +1,5 @@
-echo "=== Getting CAMPassport ID ==="
-          CAMPASSPORT=$(curl -sk -H "x-auth-token: $XAUTHTOKEN" "$SERVER/api/login/token" | grep -oP '(?<=\"camPassport\":\")[^"]+')
-          echo "CAMPassport: ${CAMPASSPORT:0:15}... (len=${#CAMPASSPORT})"
+CAMPASSPORT=$(curl -sk -X POST "$SERVER/graphql" \
+  -H "Content-Type: application/json" \
+  -H "x-auth-token: $XAUTHTOKEN" \
+  -d '{"query":"query { loginTokens { camPassport } }"}' \
+  | grep -oP '(?<=\"camPassport\":\")[^"]+')
