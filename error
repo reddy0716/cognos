@@ -1,4 +1,68 @@
-SESSION_KEY=$(curl -sk -X PUT "https://dhcsprodcognos.ca.analytics.ibm.com/api/v1/session" \
-  -H "Content-Type: application/json" \
-  -d '{"parameters":[{"name":"CAMAPILoginKey","value":"<YOUR_API_KEY>"}]}' \
-  | grep -oP '(?<="session_key":")[^"]+')
+# ---------- Builder Stage ----------
+FROM amazonlinux:latest AS builder
+
+ARG PROXY=http://10.151.204.100:8080
+RUN echo "proxy=$PROXY" >> /etc/yum.conf
+
+ENV BIN_DIR="/usr/local/bin" \
+    KUBECTL_VERSION="1.26.1" \
+    HELM_VERSION="v3.11.1" \
+    ARGO_VERSION="v2.0.3" \
+    KUSTOMIZE_VERSION="5.0.0" \
+    TARGETOS="linux" \
+    TARGETARCH="amd64" \
+    DOTNET_VERSION="8.0.204" \
+    SONAR_VERSION="5.1.0.3006"
+
+# ---------- Install base tools ----------
+RUN yum update -y && yum install -y \
+    unzip zip gzip wget curl tar jq git openssl ca-certificates which less groff shadow-utils \
+    java-17-amazon-corretto-headless \
+ && yum clean all
+
+# ---------- Install .NET 8 SDK ----------
+RUN mkdir -p /usr/share/dotnet \
+ && wget https://download.visualstudio.microsoft.com/download/pr/0d58c370-263b-4e3c-b9a9-5e1d54301542/45b3a4259b5f45b78d8b9c1a42101dd4/dotnet-sdk-${DOTNET_VERSION}-linux-x64.tar.gz \
+ && tar -xzf dotnet-sdk-${DOTNET_VERSION}-linux-x64.tar.gz -C /usr/share/dotnet \
+ && ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet \
+ && rm dotnet-sdk-${DOTNET_VERSION}-linux-x64.tar.gz
+
+# ---------- Install AWS CLI ----------
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
+ && unzip -q awscliv2.zip \
+ && ./aws/install --bin-dir /aws-cli-bin \
+ && rm -rf awscliv2.zip aws
+
+# ---------- Install Kubernetes tools ----------
+RUN curl -LO "https://storage.googleapis.com/kubernetes-release/release/v${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" \
+ && chmod +x kubectl && mv kubectl ${BIN_DIR} \
+ && curl -fL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/v${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_${TARGETOS}_${TARGETARCH}.tar.gz | tar xz \
+ && chmod +x kustomize && mv kustomize ${BIN_DIR} \
+ && curl -LO https://get.helm.sh/helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz \
+ && tar -zxvf helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz \
+ && mv linux-${TARGETARCH}/helm ${BIN_DIR}/helm \
+ && curl -sSL -o ${BIN_DIR}/argo https://github.com/argoproj/argo/releases/download/${ARGO_VERSION}/argo-linux-amd64 \
+ && chmod +x ${BIN_DIR}/argo \
+ && rm -rf linux-${TARGETARCH} helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz
+
+# ---------- Install SonarScanner CLI ----------
+RUN curl -sSL -o /tmp/sonar.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SONAR_VERSION}-linux.zip \
+ && unzip -q /tmp/sonar.zip -d /opt \
+ && ln -s /opt/sonar-scanner-${SONAR_VERSION}-linux/bin/sonar-scanner /usr/local/bin/sonar-scanner \
+ && rm /tmp/sonar.zip
+
+# ---------- Verify installations ----------
+RUN dotnet --version \
+ && java -version \
+ && sonar-scanner --version \
+ && kubectl version --client \
+ && helm version --short \
+ && argo version --short
+
+# ---------- Final Stage ----------
+FROM amazonlinux:latest
+RUN echo "proxy=http://10.151.204.100:8080" >> /etc/yum.conf
+COPY --from=builder /usr/ /usr/
+COPY --from=builder /aws-cli-bin/ /usr/local/bin/
+COPY --from=builder /opt/ /opt/
+ENTRYPOINT ["/bin/sh"]
