@@ -1,68 +1,302 @@
-# ---------- Builder Stage ----------
-FROM amazonlinux:latest AS builder
+/*
+=======================================================================================
+MotioCI → Cognos Automated Deployment Pipeline
+Maintained by: DevOps Team
+Purpose: Automate Cognos content promotion from DEV/TEST to PRD using MotioCI CLI.
+=======================================================================================
+*/
 
-ARG PROXY=http://10.151.204.100:8080
-RUN echo "proxy=$PROXY" >> /etc/yum.conf
+def branch = env.BRANCH_NAME ?: "DEV"
+def namespace = env.NAMESPACE ?: "dev"
+def cloudName = env.CLOUD_NAME == "openshift" ? "openshift" : "kubernetes"
+def workingDir = "/home/jenkins/agent"
 
-ENV BIN_DIR="/usr/local/bin" \
-    KUBECTL_VERSION="1.26.1" \
-    HELM_VERSION="v3.11.1" \
-    ARGO_VERSION="v2.0.3" \
-    KUSTOMIZE_VERSION="5.0.0" \
-    TARGETOS="linux" \
-    TARGETARCH="amd64" \
-    DOTNET_VERSION="8.0.204" \
-    SONAR_VERSION="5.1.0.3006"
+APP_NAME = "combined-devops-cognos-deployments"
 
-# ---------- Install base tools ----------
-RUN yum update -y && yum install -y \
-    unzip zip gzip wget curl tar jq git openssl ca-certificates which less groff shadow-utils \
-    java-17-amazon-corretto-headless \
- && yum clean all
+pipeline {
+  agent {
+    kubernetes {
+      yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins
+  volumes:
+    - name: dockersock
+      hostPath:
+        path: /var/run/docker.sock
+    - name: varlibcontainers
+      emptyDir: {}
+    - name: jenkins-trusted-ca-bundle
+      configMap:
+        name: jenkins-trusted-ca-bundle
+        defaultMode: 420
+        optional: true
+  containers:
+    - name: jnlp
+      securityContext:
+        privileged: true
+      envFrom:
+        - configMapRef:
+            name: jenkins-agent-env
+            optional: true
+      env:
+        - name: GIT_SSL_CAINFO
+          value: "/etc/pki/tls/certs/ca-bundle.crt"
+      volumeMounts:
+        - name: jenkins-trusted-ca-bundle
+          mountPath: /etc/pki/tls/certs
 
-# ---------- Install .NET 8 SDK ----------
-RUN mkdir -p /usr/share/dotnet \
- && wget https://download.visualstudio.microsoft.com/download/pr/0d58c370-263b-4e3c-b9a9-5e1d54301542/45b3a4259b5f45b78d8b9c1a42101dd4/dotnet-sdk-${DOTNET_VERSION}-linux-x64.tar.gz \
- && tar -xzf dotnet-sdk-${DOTNET_VERSION}-linux-x64.tar.gz -C /usr/share/dotnet \
- && ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet \
- && rm dotnet-sdk-${DOTNET_VERSION}-linux-x64.tar.gz
+    - name: node
+      image: registry.access.redhat.com/ubi8/nodejs-16:latest
+      tty: true
+      command: ["/bin/bash"]
+      workingDir: ${workingDir}
+      securityContext:
+        privileged: true
+      envFrom:
+        - configMapRef:
+            name: jenkins-agent-env
+            optional: true
+      env:
+        - name: HOME
+          value: ${workingDir}
+        - name: BRANCH
+          value: ${branch}
+        - name: GIT_SSL_CAINFO
+          value: "/etc/pki/tls/certs/ca-bundle.crt"
+      volumeMounts:
+        - name: jenkins-trusted-ca-bundle
+          mountPath: /etc/pki/tls/certs
 
-# ---------- Install AWS CLI ----------
-RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
- && unzip -q awscliv2.zip \
- && ./aws/install --bin-dir /aws-cli-bin \
- && rm -rf awscliv2.zip aws
+    - name: python
+      image: 136299550619.dkr.ecr.us-west-2.amazonaws.com/cammisboto3:1.2.0
+      tty: true
+      command: ["/bin/bash"]
+      workingDir: ${workingDir}
+      securityContext:
+        privileged: true
+      envFrom:
+        - configMapRef:
+            name: jenkins-agent-env
+            optional: true
+      env:
+        - name: HOME
+          value: ${workingDir}
+        - name: BRANCH
+          value: ${branch}
+        - name: GIT_SSL_CAINFO
+          value: "/etc/pki/tls/certs/ca-bundle.crt"
+      volumeMounts:
+        - name: jenkins-trusted-ca-bundle
+          mountPath: /etc/pki/tls/certs
+"""
+    }
+  }
 
-# ---------- Install Kubernetes tools ----------
-RUN curl -LO "https://storage.googleapis.com/kubernetes-release/release/v${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" \
- && chmod +x kubectl && mv kubectl ${BIN_DIR} \
- && curl -fL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/v${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_${TARGETOS}_${TARGETARCH}.tar.gz | tar xz \
- && chmod +x kustomize && mv kustomize ${BIN_DIR} \
- && curl -LO https://get.helm.sh/helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz \
- && tar -zxvf helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz \
- && mv linux-${TARGETARCH}/helm ${BIN_DIR}/helm \
- && curl -sSL -o ${BIN_DIR}/argo https://github.com/argoproj/argo/releases/download/${ARGO_VERSION}/argo-linux-amd64 \
- && chmod +x ${BIN_DIR}/argo \
- && rm -rf linux-${TARGETARCH} helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz
+  environment {
+    GIT_BRANCH = "${BRANCH_NAME}"
+  }
 
-# ---------- Install SonarScanner CLI ----------
-RUN curl -sSL -o /tmp/sonar.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SONAR_VERSION}-linux.zip \
- && unzip -q /tmp/sonar.zip -d /opt \
- && ln -s /opt/sonar-scanner-${SONAR_VERSION}-linux/bin/sonar-scanner /usr/local/bin/sonar-scanner \
- && rm /tmp/sonar.zip
+  options {
+    disableConcurrentBuilds()
+    timestamps()
+  }
 
-# ---------- Verify installations ----------
-RUN dotnet --version \
- && java -version \
- && sonar-scanner --version \
- && kubectl version --client \
- && helm version --short \
- && argo version --short
+  stages {
 
-# ---------- Final Stage ----------
-FROM amazonlinux:latest
-RUN echo "proxy=http://10.151.204.100:8080" >> /etc/yum.conf
-COPY --from=builder /usr/ /usr/
-COPY --from=builder /aws-cli-bin/ /usr/local/bin/
-COPY --from=builder /opt/ /opt/
-ENTRYPOINT ["/bin/sh"]
+    stage('Initialize') {
+      steps {
+        script {
+          echo "Branch: ${env.GIT_BRANCH}"
+          echo "Initializing MotioCI → Cognos pipeline..."
+        }
+      }
+    }
+
+    stage('Check Python Availability') {
+      steps {
+        container('node') {
+          sh '''
+            echo "Checking for Python3..."
+            which python3 || echo "Python3 is NOT installed"
+            python3 --version || echo "Unable to get Python version"
+          '''
+        }
+      }
+    }
+
+    stage('MotioCI Login') {
+      steps {
+        container('python') {
+          sh '''
+            set -euo pipefail
+            cd MotioCI/api/CLI
+
+            echo "Installing MotioCI CLI dependencies..."
+            python3 -m pip install --user -r requirements.txt
+
+            echo "Creating credentials JSON..."
+            cat <<ENDJSON > creds.json
+[
+  {
+    "instanceId": "1",
+    "apiKey": "AWlGMEQ4OUM2RkIyQzM0OUIzQTBFMEQ1OUM5MzRCM0M3RYJm/hgt2Duf9rDSo6EiYmE1RaWG"
+  },
+  {
+    "instanceId": "3",
+    "apiKey": "AWlFMTc2QUMzM0YwM0E0RTg4OUJDQUIyMTIzNjY2NEI5NZTADudaMR2xZKCPVFaRLu2/LEp5"
+  }
+]
+ENDJSON
+
+            echo "Logging in to MotioCI..."
+            python3 ci-cli.py --server="https://cgrptmcip01.cloud.cammis.ca.gov" \
+              login --credentialsFile creds.json > login.out 2>&1 || true
+
+            echo "=== login.out (first 40 lines) ==="
+            sed -n '1,40p' login.out || true
+            echo "================================="
+
+            awk 'match($0,/(Auth[[:space:]]*[Tt]oken|x-auth_token|xauthtoken)[[:space:]]*[:=][[:space:]]*([A-Za-z0-9._-]+)/,m){print m[2]}' login.out | tail -n1 > login.token || true
+
+            TOKEN=$(cat login.token 2>/dev/null || true)
+            echo "MotioCI token captured (len=${#TOKEN})"
+            echo "$TOKEN" > ../token.txt
+          '''
+        }
+      }
+    }
+
+    stage('Auth: Cognos API Session (PROD)') {
+      steps {
+        container('python') {
+          withCredentials([string(credentialsId: 'cognos-api-key-prd', variable: 'COGNOS_API_KEY_PRD')]) {
+            sh '''
+              set -eu
+              echo "Starting Cognos API session (PROD)..."
+              BASE="https://dhcsprodcognos.ca.analytics.ibm.com/api/v1"
+
+              rm -f login.json session.json || true
+              mkdir -p MotioCI/api
+
+              cat > login.json <<JSON
+{ "parameters": [ { "name": "CAMAPILoginKey", "value": "$COGNOS_API_KEY_PRD" } ] }
+JSON
+
+              curl --fail-with-body -sS -X PUT "$BASE/session" \
+                -H "Content-Type: application/json" \
+                -d @login.json -o session.json
+
+              SESSION_KEY=$(python3 -c 'import json; print(json.load(open("session.json")).get("session_key",""))')
+              if [ -z "$SESSION_KEY" ]; then
+                echo "ERROR: No session_key from PROD Cognos."
+                cat session.json || true
+                exit 1
+              fi
+
+              echo "Cognos API session verified for PROD."
+              printf "PROD_CAMPASSPORT='%s'\n" "$SESSION_KEY" > MotioCI/api/motio_env_prod
+            '''
+          }
+        }
+
+        script {
+          def envFile = readFile('MotioCI/api/motio_env_prod').trim()
+          envFile.split("\n").each { line ->
+            def (k, v) = line.split('=', 2)
+            if (v.startsWith("'") && v.endsWith("'")) {
+              v = v.substring(1, v.length() - 1)
+            }
+            env[k] = v
+          }
+          echo "Captured Cognos PROD Passport: ${env.PROD_CAMPASSPORT.take(15)}..."
+        }
+      }
+    }
+
+    stage('MotioCI Token Debug') {
+      steps {
+        container('python') {
+          sh '''
+            set -euo pipefail
+            cd MotioCI/api/CLI
+            TOKEN=$(cat ../token.txt)
+            echo "Testing token: ${TOKEN:0:6}... (len=${#TOKEN})"
+
+            echo "=== Listing instances ==="
+            python3 ci-cli.py --server="https://cgrptmcip01.cloud.cammis.ca.gov" \
+              instance ls --xauthtoken "$TOKEN" || true
+
+            echo "=== Listing projects (DEV/TEST) ==="
+            python3 ci-cli.py --server="https://cgrptmcip01.cloud.cammis.ca.gov" \
+              project ls --instanceName "Cognos-DEV/TEST" --xauthtoken "$TOKEN" || true
+
+            echo "=== Listing projects (PRD) ==="
+            python3 ci-cli.py --server="https://cgrptmcip01.cloud.cammis.ca.gov" \
+              project ls --instanceName "Cognos-PRD" --xauthtoken "$TOKEN" || true
+          '''
+        }
+      }
+    }
+
+    stage('MotioCI Deploy (DEV → PRD)') {
+      steps {
+        container('python') {
+          script {
+            def sessionKey = env.PROD_CAMPASSPORT?.trim()
+            if (!sessionKey) {
+              error "Missing Cognos PROD session key (PROD_CAMPASSPORT). Please check Cognos Auth stage."
+            }
+
+            sh """
+              set -euo pipefail
+              cd MotioCI/api/CLI
+
+              TOKEN=\$(cat ../token.txt)
+              SOURCE_LABEL_ID=57
+
+              echo "=== Starting Promotion from DEV/TEST → PRD ==="
+              echo "Using token: \${TOKEN:0:6}... (len=\${#TOKEN})"
+              echo "Promoting Label ID: \$SOURCE_LABEL_ID from DEV/TEST to PRD"
+
+              python3 ci-cli.py \\
+                --server="https://cgrptmcip01.cloud.cammis.ca.gov" \\
+                deploy \\
+                --xauthtoken "\$TOKEN" \\
+                --sourceInstanceId 3 \\
+                --targetInstanceId 1 \\
+                --projectName "Demo" \\
+                --labelId "\$SOURCE_LABEL_ID" \\
+                --targetLabelName "PROMOTED-\${BUILD_NUMBER}" \\
+                --camPassportId "${sessionKey}" > deploy.out 2>&1 || true
+
+              echo "=== Deploy Output (first 100 lines) ==="
+              sed -n '1,100p' deploy.out || true
+              echo "======================================="
+
+              if grep -q '"errors"' deploy.out; then
+                echo "MotioCI Deploy failed — see deploy.out above for details."
+                exit 1
+              else
+                echo "MotioCI Deploy stage completed successfully."
+              fi
+            """
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "Pipeline execution finished."
+    }
+    success {
+      echo "MotioCI pipeline completed successfully."
+    }
+    failure {
+      echo "MotioCI pipeline failed."
+    }
+  }
+}
