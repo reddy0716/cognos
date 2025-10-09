@@ -188,15 +188,19 @@ JSON
                 -H "Content-Type: application/json" \
                 -d @login.json -o session.json
 
-              SESSION_KEY=$(python3 -c 'import json; print(json.load(open("session.json")).get("session_key",""))')
-              if [ -z "$SESSION_KEY" ]; then
+              RAW_KEY=$(python3 -c 'import json; print(json.load(open("session.json")).get("session_key",""))')
+              if [ -z "$RAW_KEY" ]; then
                 echo "ERROR: No session_key from PROD Cognos."
                 cat session.json || true
                 exit 1
               fi
 
+              # Strip CAM prefix if present
+              SESSION_KEY=$(echo "$RAW_KEY" | sed 's/^CAM[ ]*//')
+
               echo "Cognos API session verified for PROD."
               printf "PROD_CAMPASSPORT='%s'\n" "$SESSION_KEY" > MotioCI/api/motio_env_prod
+              echo "Saved clean session key (no CAM prefix)"
             '''
           }
         }
@@ -210,7 +214,7 @@ JSON
             }
             env[k] = v
           }
-          echo "Captured Cognos PROD Passport: ${env.PROD_CAMPASSPORT.take(15)}..."
+          echo "Captured Cognos PROD Passport (cleaned): ${env.PROD_CAMPASSPORT.take(15)}..."
         }
       }
     }
