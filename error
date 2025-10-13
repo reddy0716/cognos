@@ -1,12 +1,14 @@
-Hi MotioCI Team,
+Hi Team,
 
-I wanted to let you know that the deployment was successfully executed.
-I have updated the pipeline to dynamically generate both the AuthToken and CamPassportID, and used them in the deploy command — the promotion from DEV/TEST → PROD completed successfully.
+We successfully completed a POC to automate the MotioCI–Cognos deployment process by dynamically generating both the X-Auth Token and CAMPassportId (Session Key) within the Jenkins pipeline.
 
-Previously, the CamPassportID was being generated with the “CAM” prefix, which caused an error during deployment. I’ve implemented a fix to strip that prefix, and everything is now working as expected.
+The X-Auth Token is generated from the MotioCI URL using the API key and instance ID, enabling access to both DEV/TEST and PROD instances simultaneously.
 
-Thank you for your time and support in reviewing the permissions and helping identify the root cause. I really appreciate your assistance throughout this process.
-If you’d like, I can share a detailed reference of the steps we followed to achieve this successful deployment.
+The Session Key (CAMPassportId) is retrieved specifically for the PROD instance using its instance ID and API key, based on parameters provided by the IBM Cognos team.
 
-Best regards,
-Srinivas Reddy
+Both credentials are then dynamically injected into the deploy stage, allowing automated promotions without manual token or passport entry.
+
+The POC successfully validated the dynamic authentication and automated deployment flow from DEV/TEST → PROD.
+
+Next Step:
+We’ll coordinate with the Cognos Admin team to understand all deployment scenarios — including folder promotions, individual report movements, and manual end-to-end deployment activities — and work toward fully automating these processes through MotioCI and Jenkins.
