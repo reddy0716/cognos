@@ -1,44 +1,32 @@
-stage('MotioCI login → token (CAMPassport → LDAP)') {
+stage('Validate Source Content') {
   steps {
     container('python') {
-      sh '''
-/bin/bash -lc "
-  set -Eeuo pipefail
-  cd MotioCI/api/CLI
+      script {
+        if (params.OBJECT_PATH?.trim()) {
+          sh '''
+            set -e
+            cd MotioCI/api/CLI
+            TOKEN=$(cat ../../token.txt)
+            echo "Validating object path in source project..."
+            echo "Using searchPath=/content${OBJECT_PATH}"
 
-  # Ensure requests is present (no-op if already installed)
-  python3 -m pip -q install --no-input requests || true
+            python3 ci-cli.py versionedItems ls \
+              --server="$MOTIO_SERVER" \
+              --instanceName "$SOURCE_INSTANCE" \
+              --projectName "$PROJECT_NAME" \
+              --xauthtoken "$TOKEN" \
+              --searchPath="starts:/content/" \
+              --currentOnly=True | grep -F "${OBJECT_PATH}" || {
+                echo "Object ${OBJECT_PATH} not found in source project.";
+                echo "Tip: Try checking the exact path in MotioCI UI (right-click → Properties).";
+                exit 1; }
 
-  # ====== Hardcoded settings (as requested) ======
-  MOTIO_SERVER='https://cgrptmcip01.cloud.cammis.ca.gov'
-
-  # Try CAMPassport first
-  CAM_PASSPORT_ID='hiufjihnfjivduafhiugfvwegfciwqehi5255'
-
-  # Fallback to LDAP user/pass
-  NS='ldap'
-  USER='srinu'
-  PASS='bindu143'
-  # ==============================================
-
-  TOKEN=\"\"
-
-  echo \"Trying MotioCI login with CAMPassport...\" >&2
-  TOKEN=\"$(python3 ci-cli.py --server=\"$MOTIO_SERVER\" --non-interactive \\
-            login --camPassportId \"$CAM_PASSPORT_ID\" || true)\"
-
-  if [ -z \"$TOKEN\" ]; then
-    echo \"CAMPassport failed; trying LDAP username/password...\" >&2
-    TOKEN=\"$(python3 ci-cli.py --server=\"$MOTIO_SERVER\" --non-interactive \\
-              login --username \"$USER\" --password \"$PASS\" --namespaceId \"$NS\" || true)\"
-  fi
-
-  test -n \"$TOKEN\" || { echo \"ERROR: MotioCI login failed (both methods).\" >&2; exit 1; }
-
-  printf \"%s\" \"$TOKEN\" > .motio_token
-  echo \"✅ MotioCI token saved to $(pwd)/.motio_token\"
-"
-'''
+            echo "Object ${OBJECT_PATH} exists in source project; proceeding with label creation."
+          '''
+        } else {
+          echo "No OBJECT_PATH provided — deploying entire project (skipping object validation)."
+        }
+      }
     }
   }
 }
