@@ -17,7 +17,7 @@ echo """
         """
 
 
-/Team Content/Jenkins_srini_folder/JenkinsSriniTestReport
+/Team Content/DemoFolder/Jenkins_srini_folder/jenkinssrinitestreport
 stage('Validate Source Content') {
       steps {
         container('python') {
