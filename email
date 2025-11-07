@@ -1,32 +1,223 @@
-stage('Validate Source Content') {
-  steps {
-    container('python') {
-      script {
-        if (params.OBJECT_PATH?.trim()) {
+/*
+=======================================================================================
+MotioCI → Cognos Automated Deployment Pipeline
+Maintained by: DevOps Team
+Purpose: Automate Cognos content promotion (DEV/TEST → PRD) using MotioCI CLI.
+=======================================================================================
+*/
+
+def workingDir = "/home/jenkins/agent"
+
+pipeline {
+  agent {
+    kubernetes {
+      yaml """
+        apiVersion: v1
+        kind: Pod
+        spec:
+          serviceAccountName: jenkins
+          containers:
+            - name: python
+              image: 136299550619.dkr.ecr.us-west-2.amazonaws.com/cammisboto3:1.2.0
+              tty: true
+              command: ["/bin/bash"]
+              workingDir: ${workingDir}
+              securityContext: { privileged: true }
+      """
+    }
+  }
+
+  parameters {
+    choice(name: 'SOURCE_ENV', choices: ['Cognos-DEV/TEST', 'Cognos-SIT'], description: 'Source Cognos environment to deploy from')
+    choice(name: 'TARGET_ENV', choices: ['Cognos-PRD'], description: 'Target Cognos environment')
+    string(name: 'PROJECT_NAME', defaultValue: 'Demo', description: 'MotioCI Project Name')
+    string(name: 'OBJECT_PATH', defaultValue: '/Team Content/MotioCI Reports/Testing/Test Results Detail', description: 'Cognos object path (prettyPath)')
+    booleanParam(name: 'AUTO_LABEL', defaultValue: true, description: 'Automatically create pre/post deployment labels')
+  }
+
+  environment {
+    MOTIO_SERVER = "https://cgrptmcip01.cloud.cammis.ca.gov"
+  }
+
+  options {
+    disableConcurrentBuilds()
+    timestamps()
+  }
+
+  stages {
+
+    stage('Initialize') {
+      steps {
+        script {
+          echo "================================================"
+          echo "MotioCI → Cognos Deployment Pipeline"
+          echo "================================================"
+          echo "Source: ${params.SOURCE_ENV}"
+          echo "Target: ${params.TARGET_ENV}"
+          echo "Project: ${params.PROJECT_NAME}"
+          echo "Object Path: ${params.OBJECT_PATH}"
+          echo "================================================"
+        }
+      }
+    }
+
+    stage('MotioCI Login') {
+      steps {
+        withCredentials([file(credentialsId: 'cognos-credentials', variable: 'CREDENTIALS_FILE')]) {
+          container('python') {
+            sh '''
+              set -e
+              cd MotioCI/api/CLI
+
+              echo "Logging in to MotioCI..."
+              python3 ci-cli.py --server="$MOTIO_SERVER" \
+                login --credentialsFile "$CREDENTIALS_FILE" > login.out 2>&1 || true
+
+              awk 'match($0,/(Auth[[:space:]]*[Tt]oken|x-auth_token|xauthtoken)[[:space:]]*[:=][[:space:]]*([A-Za-z0-9._-]+)/,m){print m[2]}' login.out | tail -n1 > login.token
+              TOKEN=$(cat login.token || true)
+              if [ -z "$TOKEN" ]; then
+                echo "ERROR: Failed to capture token."; cat login.out; exit 1;
+              fi
+              echo "$TOKEN" > ../token.txt
+              echo "✓ MotioCI login successful"
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Pre-Deployment Auto-Label') {
+      when { expression { params.AUTO_LABEL } }
+      steps {
+        container('python') {
           sh '''
             set -e
             cd MotioCI/api/CLI
-            TOKEN=$(cat ../../token.txt)
-            echo "Validating object path in source project..."
-            echo "Using searchPath=/content${OBJECT_PATH}"
-
-            python3 ci-cli.py versionedItems ls \
-              --server="$MOTIO_SERVER" \
-              --instanceName "$SOURCE_INSTANCE" \
-              --projectName "$PROJECT_NAME" \
+            TOKEN=$(cat ../token.txt)
+            LABEL_NAME="PreDeploy_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
+            echo "Creating Pre-Deployment Label: $LABEL_NAME"
+            python3 ci-cli.py --server="$MOTIO_SERVER" \
+              label create \
               --xauthtoken "$TOKEN" \
-              --searchPath="starts:/content/" \
-              --currentOnly=True | grep -F "${OBJECT_PATH}" || {
-                echo "Object ${OBJECT_PATH} not found in source project.";
-                echo "Tip: Try checking the exact path in MotioCI UI (right-click → Properties).";
-                exit 1; }
-
-            echo "Object ${OBJECT_PATH} exists in source project; proceeding with label creation."
+              --instanceName "${SOURCE_ENV}" \
+              --projectName "${PROJECT_NAME}" \
+              --name "$LABEL_NAME"
+            echo "$LABEL_NAME" > ../pre_label.txt
           '''
-        } else {
-          echo "No OBJECT_PATH provided — deploying entire project (skipping object validation)."
         }
       }
+    }
+
+    stage('Validate Object Path Exists') {
+      steps {
+        container('python') {
+          sh '''
+            set -e
+            cd MotioCI/api/CLI
+            TOKEN=$(cat ../token.txt)
+            echo "Validating object path in ${SOURCE_ENV}..."
+            python3 ci-cli.py --server="$MOTIO_SERVER" \
+              versionedItems ls \
+              --xauthtoken "$TOKEN" \
+              --instanceName "${SOURCE_ENV}" \
+              --projectName "${PROJECT_NAME}" \
+              --searchPath "${OBJECT_PATH}" \
+              --currentOnly True > validate.out 2>&1 || true
+
+            if ! grep -q "${OBJECT_PATH}" validate.out; then
+              echo "Object ${OBJECT_PATH} not found in ${PROJECT_NAME}/${SOURCE_ENV}."
+              echo "Tip: Check path or add it to MotioCI project."
+              cat validate.out || true
+              exit 1
+            fi
+            echo "Object ${OBJECT_PATH} validated successfully."
+          '''
+        }
+      }
+    }
+
+    stage('Create Label & Deploy') {
+      steps {
+        container('python') {
+          withCredentials([string(credentialsId: 'cognos-api-key-prd', variable: 'COGNOS_API_KEY_PRD')]) {
+            sh '''
+              set -e
+              cd MotioCI/api/CLI
+              TOKEN=$(cat ../token.txt)
+
+              # Create dynamic label
+              LABEL_NAME="Deploy_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
+              echo "Creating Deployment Label: $LABEL_NAME"
+              python3 ci-cli.py --server="$MOTIO_SERVER" \
+                label create \
+                --xauthtoken "$TOKEN" \
+                --instanceName "${SOURCE_ENV}" \
+                --projectName "${PROJECT_NAME}" \
+                --name "$LABEL_NAME"
+
+              echo "Retrieving PROD CAMPassport..."
+              BASE="https://dhcsprodcognos.ca.analytics.ibm.com/api/v1"
+              echo "{\\"parameters\\":[{\\"name\\":\\"CAMAPILoginKey\\",\\"value\\":\\"$COGNOS_API_KEY_PRD\\"}]}" > login.json
+              curl -sS -X PUT "$BASE/session" -H "Content-Type: application/json" -d @login.json -o session.json
+              SESSION_KEY=$(python3 -c 'import json; print(json.load(open("session.json")).get("session_key",""))')
+              if [ -z "$SESSION_KEY" ]; then echo "ERROR: Missing session key."; exit 1; fi
+
+              echo "Deploying label ${LABEL_NAME}..."
+              python3 ci-cli.py --server="$MOTIO_SERVER" \
+                deploy \
+                --xauthtoken "$TOKEN" \
+                --sourceInstanceName "${SOURCE_ENV}" \
+                --targetInstanceName "${TARGET_ENV}" \
+                --projectName "${PROJECT_NAME}" \
+                --labelName "$LABEL_NAME" \
+                --targetLabelName "PROMOTED_${BUILD_NUMBER}" \
+                --camPassportId "$SESSION_KEY" > deploy.out 2>&1 || true
+
+              cat deploy.out
+              if grep -q '"errors"' deploy.out; then
+                echo "Deployment failed."
+                exit 1
+              fi
+              echo "Deployment completed."
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Post-Deployment Auto-Label') {
+      when { expression { params.AUTO_LABEL } }
+      steps {
+        container('python') {
+          sh '''
+            set -e
+            cd MotioCI/api/CLI
+            TOKEN=$(cat ../token.txt)
+            LABEL_NAME="PostDeploy_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
+            echo "Creating Post-Deployment Label: $LABEL_NAME"
+            python3 ci-cli.py --server="$MOTIO_SERVER" \
+              label create \
+              --xauthtoken "$TOKEN" \
+              --instanceName "${TARGET_ENV}" \
+              --projectName "${PROJECT_NAME}" \
+              --name "$LABEL_NAME"
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "================================================"
+      echo "Pipeline finished. Build: ${BUILD_NUMBER}"
+      echo "================================================"
+    }
+    success {
+      echo "MotioCI pipeline completed successfully."
+    }
+    failure {
+      echo "MotioCI pipeline failed. Check logs above."
     }
   }
 }
