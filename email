@@ -1,8 +1,8 @@
 /*
 =======================================================================================
-MotioCI → Cognos Automated Deployment Pipeline
+MotioCI → Cognos Automated Deployment Pipeline (Enhanced)
 Maintained by: DevOps Team
-Purpose: Automate Cognos content promotion (DEV/TEST → PRD) using MotioCI CLI.
+Purpose: Parameterized Cognos content promotion (DEV/TEST → PRD) with auto-labeling
 =======================================================================================
 */
 
@@ -22,17 +22,19 @@ pipeline {
               tty: true
               command: ["/bin/bash"]
               workingDir: ${workingDir}
-              securityContext: { privileged: true }
+              securityContext:
+                privileged: true
       """
     }
   }
 
   parameters {
-    choice(name: 'SOURCE_ENV', choices: ['Cognos-DEV/TEST', 'Cognos-SIT'], description: 'Source Cognos environment to deploy from')
+    choice(name: 'SOURCE_ENV', choices: ['Cognos-DEV/TEST', 'Cognos-SIT'], description: 'Source Cognos environment')
     choice(name: 'TARGET_ENV', choices: ['Cognos-PRD'], description: 'Target Cognos environment')
-    string(name: 'PROJECT_NAME', defaultValue: 'Demo', description: 'MotioCI Project Name')
-    string(name: 'OBJECT_PATH', defaultValue: '/Team Content/MotioCI Reports/Testing/Test Results Detail', description: 'Cognos object path (prettyPath)')
-    booleanParam(name: 'AUTO_LABEL', defaultValue: true, description: 'Automatically create pre/post deployment labels')
+    string(name: 'PROJECT_NAME', defaultValue: 'Demo', description: 'MotioCI project name')
+    string(name: 'OBJECT_PATH', defaultValue: '/Team Content/MotioCI Reports/Testing', description: 'Folder/report path to promote')
+    booleanParam(name: 'AUTO_LABEL', defaultValue: true, description: 'Create Pre/Post deployment labels automatically')
+    string(name: 'ROLLBACK_LABEL', defaultValue: '', description: 'Optional: enter label name to redeploy instead of creating new one')
   }
 
   environment {
@@ -46,21 +48,24 @@ pipeline {
 
   stages {
 
+    /* ─────────────────────────────────────────────────────────────── */
     stage('Initialize') {
       steps {
-        script {
-          echo "================================================"
-          echo "MotioCI → Cognos Deployment Pipeline"
-          echo "================================================"
-          echo "Source: ${params.SOURCE_ENV}"
-          echo "Target: ${params.TARGET_ENV}"
-          echo "Project: ${params.PROJECT_NAME}"
-          echo "Object Path: ${params.OBJECT_PATH}"
-          echo "================================================"
-        }
+        echo """
+================================================
+MotioCI → Cognos Deployment Pipeline (Enhanced)
+================================================
+Source: ${params.SOURCE_ENV}
+Target: ${params.TARGET_ENV}
+Project: ${params.PROJECT_NAME}
+Object Path: ${params.OBJECT_PATH}
+Rollback Label: ${params.ROLLBACK_LABEL ?: "N/A"}
+================================================
+"""
       }
     }
 
+    /* ─────────────────────────────────────────────────────────────── */
     stage('MotioCI Login') {
       steps {
         withCredentials([file(credentialsId: 'cognos-credentials', variable: 'CREDENTIALS_FILE')]) {
@@ -75,116 +80,132 @@ pipeline {
 
               awk 'match($0,/(Auth[[:space:]]*[Tt]oken|x-auth_token|xauthtoken)[[:space:]]*[:=][[:space:]]*([A-Za-z0-9._-]+)/,m){print m[2]}' login.out | tail -n1 > login.token
               TOKEN=$(cat login.token || true)
-              if [ -z "$TOKEN" ]; then
-                echo "ERROR: Failed to capture token."; cat login.out; exit 1;
-              fi
+              if [ -z "$TOKEN" ]; then echo "ERROR: Failed to capture token"; exit 1; fi
               echo "$TOKEN" > ../token.txt
-              echo "✓ MotioCI login successful"
+              echo "✓ Login successful"
             '''
           }
         }
       }
     }
 
-    stage('Pre-Deployment Auto-Label') {
-      when { expression { params.AUTO_LABEL } }
+    /* ─────────────────────────────────────────────────────────────── */
+    stage('Auto-Detect Items & Create Label') {
+      when { expression { return !params.ROLLBACK_LABEL?.trim() } }
       steps {
         container('python') {
           sh '''
             set -e
             cd MotioCI/api/CLI
             TOKEN=$(cat ../token.txt)
-            LABEL_NAME="PreDeploy_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
-            echo "Creating Pre-Deployment Label: $LABEL_NAME"
-            python3 ci-cli.py --server="$MOTIO_SERVER" \
-              label create \
-              --xauthtoken "$TOKEN" \
-              --instanceName "${SOURCE_ENV}" \
-              --projectName "${PROJECT_NAME}" \
-              --name "$LABEL_NAME"
-            echo "$LABEL_NAME" > ../pre_label.txt
-          '''
-        }
-      }
-    }
 
-    stage('Validate Object Path Exists') {
-      steps {
-        container('python') {
-          sh '''
-            set -e
-            cd MotioCI/api/CLI
-            TOKEN=$(cat ../token.txt)
-            echo "Validating object path in ${SOURCE_ENV}..."
+            echo "Discovering versioned item IDs under: ${OBJECT_PATH}"
             python3 ci-cli.py --server="$MOTIO_SERVER" \
               versionedItems ls \
               --xauthtoken "$TOKEN" \
               --instanceName "${SOURCE_ENV}" \
               --projectName "${PROJECT_NAME}" \
               --searchPath "${OBJECT_PATH}" \
-              --currentOnly True > validate.out 2>&1 || true
+              --currentOnly True > items.out
 
-            if ! grep -q "${OBJECT_PATH}" validate.out; then
-              echo "Object ${OBJECT_PATH} not found in ${PROJECT_NAME}/${SOURCE_ENV}."
-              echo "Tip: Check path or add it to MotioCI project."
-              cat validate.out || true
+            # Extract IDs dynamically
+            grep "'id':" items.out | grep -v "instanceId" | grep -o "[0-9][0-9]*" | paste -sd, - > ids.txt || true
+            IDS=$(cat ids.txt || true)
+            if [ -z "$IDS" ]; then
+              echo "ERROR: No versioned items found in ${OBJECT_PATH}"
               exit 1
             fi
-            echo "Object ${OBJECT_PATH} validated successfully."
+
+            # Pre-deployment label
+            if [ "${AUTO_LABEL}" = "true" ]; then
+              PRE_LABEL="PreDeploy_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
+              echo "Creating Pre-Deployment Label: $PRE_LABEL"
+              python3 ci-cli.py --server="$MOTIO_SERVER" label create \
+                --xauthtoken "$TOKEN" \
+                --instanceName "${SOURCE_ENV}" \
+                --projectName "${PROJECT_NAME}" \
+                --name "$PRE_LABEL"
+            fi
+
+            VERSION_NAME="AutoLabel_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
+            echo "Creating Deployment Label: $VERSION_NAME with IDs [$IDS]"
+            python3 ci-cli.py --server="$MOTIO_SERVER" label create \
+              --xauthtoken "$TOKEN" \
+              --instanceName "${SOURCE_ENV}" \
+              --projectName "${PROJECT_NAME}" \
+              --name "$VERSION_NAME" \
+              --versionedItemIds "[$IDS]"
+
+            # Get label ID
+            python3 ci-cli.py --server="$MOTIO_SERVER" label ls \
+              --xauthtoken "$TOKEN" \
+              --instanceName "${SOURCE_ENV}" \
+              --projectName "${PROJECT_NAME}" \
+              --labelName "$VERSION_NAME" > label_info.out
+
+            LABEL_ID=$(python3 -c "import ast; data=open('label_info.out').read(); parsed=ast.literal_eval(data); print(parsed['data']['instances']['edges'][0]['node']['projects']['edges'][0]['node']['labels']['edges'][0]['node']['id'])" 2>/dev/null || echo "")
+            echo "$LABEL_ID" > ../label_id.txt
+            echo "Label $VERSION_NAME (ID: $LABEL_ID) created successfully."
           '''
         }
       }
     }
 
-    stage('Create Label & Deploy') {
+    /* ─────────────────────────────────────────────────────────────── */
+    stage('Retrieve CAMPassport & Deploy') {
       steps {
         container('python') {
           withCredentials([string(credentialsId: 'cognos-api-key-prd', variable: 'COGNOS_API_KEY_PRD')]) {
             sh '''
               set -e
               cd MotioCI/api/CLI
+
+              # If rollback specified, skip label creation
+              if [ -n "${ROLLBACK_LABEL}" ]; then
+                echo "Using existing rollback label: ${ROLLBACK_LABEL}"
+                echo "0" > ../label_id.txt
+              fi
+
               TOKEN=$(cat ../token.txt)
-
-              # Create dynamic label
-              LABEL_NAME="Deploy_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
-              echo "Creating Deployment Label: $LABEL_NAME"
-              python3 ci-cli.py --server="$MOTIO_SERVER" \
-                label create \
-                --xauthtoken "$TOKEN" \
-                --instanceName "${SOURCE_ENV}" \
-                --projectName "${PROJECT_NAME}" \
-                --name "$LABEL_NAME"
-
-              echo "Retrieving PROD CAMPassport..."
+              echo "Obtaining PROD CAMPassport..."
               BASE="https://dhcsprodcognos.ca.analytics.ibm.com/api/v1"
               echo "{\\"parameters\\":[{\\"name\\":\\"CAMAPILoginKey\\",\\"value\\":\\"$COGNOS_API_KEY_PRD\\"}]}" > login.json
               curl -sS -X PUT "$BASE/session" -H "Content-Type: application/json" -d @login.json -o session.json
               SESSION_KEY=$(python3 -c 'import json; print(json.load(open("session.json")).get("session_key",""))')
-              if [ -z "$SESSION_KEY" ]; then echo "ERROR: Missing session key."; exit 1; fi
+              SESSION_KEY=$(echo "$SESSION_KEY" | sed 's/^CAM[ ]*//')
+              echo "✓ CAMPassport captured"
 
-              echo "Deploying label ${LABEL_NAME}..."
-              python3 ci-cli.py --server="$MOTIO_SERVER" \
-                deploy \
+              if [ -n "${ROLLBACK_LABEL}" ]; then
+                LABEL_NAME="${ROLLBACK_LABEL}"
+                echo "Promoting rollback label ${ROLLBACK_LABEL}"
+                DEPLOY_LABEL_NAME="Rollback_${BUILD_NUMBER}"
+              else
+                LABEL_ID=$(cat ../label_id.txt)
+                LABEL_NAME=""
+                DEPLOY_LABEL_NAME="PROMOTED_${BUILD_NUMBER}"
+              fi
+
+              echo "Deploying to ${TARGET_ENV}..."
+              python3 ci-cli.py --server="$MOTIO_SERVER" deploy \
                 --xauthtoken "$TOKEN" \
                 --sourceInstanceName "${SOURCE_ENV}" \
                 --targetInstanceName "${TARGET_ENV}" \
                 --projectName "${PROJECT_NAME}" \
-                --labelName "$LABEL_NAME" \
-                --targetLabelName "PROMOTED_${BUILD_NUMBER}" \
+                ${LABEL_NAME:+--labelName "$LABEL_NAME"} \
+                ${LABEL_ID:+--labelId "$LABEL_ID"} \
+                --targetLabelName "$DEPLOY_LABEL_NAME" \
                 --camPassportId "$SESSION_KEY" > deploy.out 2>&1 || true
 
               cat deploy.out
-              if grep -q '"errors"' deploy.out; then
-                echo "Deployment failed."
-                exit 1
-              fi
-              echo "Deployment completed."
+              if grep -q '"errors"' deploy.out; then echo "❌ Deployment failed"; exit 1; fi
+              echo "✅ Deployment executed successfully."
             '''
           }
         }
       }
     }
 
+    /* ─────────────────────────────────────────────────────────────── */
     stage('Post-Deployment Auto-Label') {
       when { expression { params.AUTO_LABEL } }
       steps {
@@ -193,14 +214,14 @@ pipeline {
             set -e
             cd MotioCI/api/CLI
             TOKEN=$(cat ../token.txt)
-            LABEL_NAME="PostDeploy_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
-            echo "Creating Post-Deployment Label: $LABEL_NAME"
-            python3 ci-cli.py --server="$MOTIO_SERVER" \
-              label create \
+            POST_LABEL="PostDeploy_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
+            echo "Creating Post-Deployment Label: $POST_LABEL"
+            python3 ci-cli.py --server="$MOTIO_SERVER" label create \
               --xauthtoken "$TOKEN" \
               --instanceName "${TARGET_ENV}" \
               --projectName "${PROJECT_NAME}" \
-              --name "$LABEL_NAME"
+              --name "$POST_LABEL"
+            echo "Post-deployment label created successfully."
           '''
         }
       }
@@ -210,14 +231,10 @@ pipeline {
   post {
     always {
       echo "================================================"
-      echo "Pipeline finished. Build: ${BUILD_NUMBER}"
+      echo "Pipeline complete — Build #${BUILD_NUMBER}"
       echo "================================================"
     }
-    success {
-      echo "MotioCI pipeline completed successfully."
-    }
-    failure {
-      echo "MotioCI pipeline failed. Check logs above."
-    }
+    success { echo "✅ MotioCI promotion successful." }
+    failure { echo "❌ MotioCI promotion failed — check logs." }
   }
 }
