@@ -1,3 +1,21 @@
+if [ -z "${OBJECT_PATH}" ]; then
+          echo "No OBJECT_PATH provided — deploying ALL items from project ${PROJECT_NAME}"
+          SEARCH_OPTION=""
+        else
+          echo "Discovering versioned items under: ${OBJECT_PATH}"
+          SEARCH_OPTION="--searchPath starts:${OBJECT_PATH}"
+        fi
+
+        # ─── Get items (folder, object, or full project) ─────────────────────
+        python3 ci-cli.py \
+          --server="$MOTIO_SERVER" \
+          versionedItems ls \
+          --xauthtoken "$TOKEN" \
+          --instanceName "${SOURCE_ENV}" \
+          --projectName "${PROJECT_NAME}" \
+          $SEARCH_OPTION \
+          --currentOnly True > items.out
+
 /*
 =======================================================================================
 MotioCI → Cognos Automated Deployment Pipeline (Enhanced)
