@@ -1,27 +1,22 @@
-def getDynamicFolders() {
-  try {
-    def MOTIO_SERVER = "https://cgrptmcip01.cloud.cammis.ca.gov"
-    def SOURCE_ENV = "Cognos-DEV/TEST"
-    def PROJECT_NAME = "Demo"
-    def folderList = ["Deploy Whole Project"]
+import groovy.json.JsonSlurper
 
-    // Run the MotioCI CLI via Python to get live folder paths
-    def output = sh(script: """
-      cd MotioCI/api/CLI || exit 0
-      python3 ci-cli.py --server="${MOTIO_SERVER}" versionedItems ls \
-        --instanceName "${SOURCE_ENV}" \
-        --projectName "${PROJECT_NAME}" --currentOnly True | grep "searchPath" | grep "/Team Content" | awk -F"'" '{print \$4}' | sort -u
-    """, returnStdout: true).trim()
+def MOTIO_SERVER = "https://cgrptmcip01.cloud.cammis.ca.gov"
+def SOURCE_ENV = SOURCE_ENV ?: "Cognos-DEV/TEST"
 
-    if (output) {
-      folderList.addAll(output.split("\\n"))
-    } else {
-      folderList.add("/Team Content/MotioCI Reports/Default Folder")
+def projects = []
+try {
+    def cmd = """
+      python3 /var/lib/jenkins/workspace/MotioCI/api/CLI/ci-cli.py \
+        --server=${MOTIO_SERVER} project ls \
+        --instanceName ${SOURCE_ENV}
+    """
+    def output = cmd.execute().text
+    def lines = output.readLines().findAll { it.contains("'name':") }
+    lines.each {
+        def name = it.split("'")[3]
+        projects << name
     }
-
-    return folderList.unique()
-  } catch (e) {
-    echo "⚠️ Dynamic folder retrieval failed: ${e.getMessage()}"
-    return ["Deploy Whole Project"]
-  }
+    return projects.unique().sort()
+} catch (Exception e) {
+    return ["Failed to fetch projects: ${e.message}"]
 }
