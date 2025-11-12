@@ -1,4 +1,11 @@
-cd /var/lib/jenkins/workspace/MotioCI/api/CLI
-python3 ci-cli.py \
-  --server=https://cgrptmcip01.cloud.cammis.ca.gov \
-  login --credentialsFile /var/lib/jenkins/credentials/cognos-credentials
+import com.cloudbees.plugins.credentials.*
+import com.cloudbees.plugins.credentials.domains.*
+
+def store = Jenkins.instance.getExtensionList('com.cloudbees.plugins.credentials.SystemCredentialsProvider')[0].getStore()
+def allCreds = store.getCredentials(Domain.global())
+
+println "===== Jenkins Global Credentials ====="
+allCreds.each { c ->
+    println "ID: ${c.id} | Type: ${c.class.simpleName}"
+}
+return
