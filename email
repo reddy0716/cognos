@@ -1,60 +1,80 @@
 import groovy.json.JsonSlurper
 
-// Jenkins credential lookup via built-in classes
-def j = Jenkins.getInstance()
-def credsList = j.getExtensionList('com.cloudbees.plugins.credentials.SystemCredentialsProvider')[0]
-def allCreds = credsList.getStore().getCredentials(com.cloudbees.plugins.credentials.domains.Domain.global())
-def cred = allCreds.find { it.id == "cognos-credentials" }
-
-if (cred == null) {
-    return ["Credential 'cognos-credentials' not found in Jenkins"]
-}
-
 // ===== CONFIGURATION =====
 def MOTIO_SERVER = "https://cgrptmcip01.cloud.cammis.ca.gov"
 def SOURCE_ENV   = SOURCE_ENV ?: "Cognos-DEV/TEST"
 def WORKSPACE    = "/var/lib/jenkins/combined-devops-cognos-deployments/MotioCI/api/CLI"
 def PYTHON       = "python3"
+def CRED_ID      = "cognos-credentials"
 // ==========================
 
 def results = []
 def TOKEN = ""
 
-
-def tmpCredFile = File.createTempFile("motio-cred-", ".json")
-tmpCredFile.deleteOnExit()
-tmpCredFile.bytes = cred.getContent()
-results << "Step1: Credential file created at ${tmpCredFile.absolutePath}"
-
-
+// --- Step 1️⃣ Get Jenkins Credential Object ---
 try {
+    results << "🔍 Step1: Searching Jenkins credentials for ID: ${CRED_ID}"
+    def j = Jenkins.getInstance()
+    def credsList = j.getExtensionList('com.cloudbees.plugins.credentials.SystemCredentialsProvider')[0]
+    def allCreds = credsList.getStore().getCredentials(com.cloudbees.plugins.credentials.domains.Domain.global())
+    def cred = allCreds.find { it.id == CRED_ID }
+
+    if (!cred) {
+        results << "❌ Step1: Credential '${CRED_ID}' not found in Jenkins!"
+        return results
+    }
+
+    results << "✅ Step1: Credential found (${cred.id})"
+
+    // --- Step 2️⃣ Write Temp Credential File ---
+    def tmpCredFile = File.createTempFile("motio-cred-", ".json")
+    tmpCredFile.deleteOnExit()
+    tmpCredFile.bytes = cred.getContent()
+    results << "✅ Step2: Temporary credentials.json created at: ${tmpCredFile.absolutePath}"
+
+    // --- Step 3️⃣ Verify CLI Path ---
+    def cliFile = new File("${WORKSPACE}/ci-cli.py")
+    if (!cliFile.exists()) {
+        results << "❌ Step3: CLI file not found at ${cliFile.absolutePath}"
+        tmpCredFile.delete()
+        return results
+    }
+    results << "✅ Step3: CLI located successfully at ${cliFile.absolutePath}"
+
+    // --- Step 4️⃣ Login to MotioCI ---
+    results << "🔍 Step4: Running login command..."
     def loginCmd = [
         "bash", "-c",
         """
         cd ${WORKSPACE} &&
         ${PYTHON} ci-cli.py --server=${MOTIO_SERVER} \
-          login --credentialsFile ${tmpCredFile.absolutePath} > login.out 2>&1 &&
-        awk 'match(\$0,/(xauthtoken|Auth[[:space:]]*Token)[[:space:]]*[:=][[:space:]]*([A-Za-z0-9._-]+)/,m){print m[2]}' login.out | tail -n1
+          login --credentialsFile ${tmpCredFile.absolutePath}
         """
     ]
+    results << "🧠 Executing command: ${loginCmd.join(' ')}"
+
     def loginProc = loginCmd.execute()
     def loginOut = new StringBuffer()
     def loginErr = new StringBuffer()
     loginProc.consumeProcessOutput(loginOut, loginErr)
     loginProc.waitFor()
 
-    TOKEN = loginOut.toString().trim()
-    results << "Login STDOUT: ${loginOut.toString()}"
-    results << "Login STDERR: ${loginErr.toString()}"
+    results << "🔹 Login STDOUT:\n${loginOut.toString()}"
+    results << "🔹 Login STDERR:\n${loginErr.toString()}"
 
+    // --- Step 5️⃣ Extract token from output ---
+    TOKEN = loginOut.toString().find(/[A-Za-z0-9._-]{20,}/)
     if (!TOKEN || TOKEN.length() < 10) {
-        results << "Step2: Login failed — no valid token retrieved!"
+        results << "❌ Step5: Login did not return a valid token!"
+        results << "⚠️ Check credentials.json or MotioCI server URL."
         tmpCredFile.delete()
         return results
     }
 
-    results << "Step2: Token captured (${TOKEN.take(10)}...)"
+    results << "✅ Step5: Token retrieved successfully (${TOKEN.take(10)}...)"
 
+    // --- Step 6️⃣ List Projects ---
+    results << "🔍 Step6: Running project listing..."
     def listCmd = [
         "bash", "-c",
         """
@@ -64,6 +84,8 @@ try {
           --instanceName ${SOURCE_ENV}
         """
     ]
+    results << "🧠 Executing command: ${listCmd.join(' ')}"
+
     def listProc = listCmd.execute()
     def listOut = new StringBuffer()
     def listErr = new StringBuffer()
@@ -71,16 +93,18 @@ try {
     listProc.waitFor()
 
     def raw = listOut.toString().trim()
-    results << "CLI STDOUT: ${raw.take(400)}"
-    results << "CLI STDERR: ${listErr.toString()}"
+    results << "🔹 CLI STDOUT (first 400 chars):\n${raw.take(400)}"
+    results << "🔹 CLI STDERR:\n${listErr.toString()}"
 
     if (!raw) {
-        results << "No projects returned — check env ${SOURCE_ENV}"
+        results << "⚠️ Step6: Empty response from CLI — token or env might be invalid."
         tmpCredFile.delete()
         return results
     }
 
+    // --- Step 7️⃣ Parse JSON Output ---
     try {
+        results << "🔍 Step7: Parsing JSON..."
         def json = new JsonSlurper().parseText(raw)
         def edges = json?.data?.instances?.edges ?: []
         def projects = []
@@ -90,20 +114,23 @@ try {
                 if (name) projects << name
             }
         }
+
         if (projects.isEmpty()) {
-            results << "JSON parsed but no projects found"
+            results << "⚠️ Step7: JSON parsed successfully, but no projects found."
         } else {
-            results << "Found ${projects.size()} projects"
+            results << "✅ Step7: Found ${projects.size()} projects."
             results.addAll(projects.unique().sort())
         }
-    } catch (pe) {
-        results << "JSON parsing error: ${pe.message}"
+    } catch (Exception pe) {
+        results << "❌ Step7: JSON parsing failed — ${pe.message}"
+        results << "⚠️ Raw JSON snippet:\n${raw.take(500)}"
     }
 
     tmpCredFile.delete()
+    results << "✅ Cleanup: Temporary credential file deleted."
+
     return results
 
 } catch (Exception e) {
-    tmpCredFile.delete()
-    return ["Unexpected error: ${e.message}"]
+    return ["❌ Unexpected error: ${e.message}", e.toString()]
 }
