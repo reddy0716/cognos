@@ -1,1 +1,7 @@
-println new File("/var/lib/jenkins/workspace/combined-devops-cognos-deployments/motioci/api/cli/ci-cli.py").exists()
+def job = Jenkins.instance.getItemByFullName("Cognos Jobs/testing")
+def lastBuild = job?.getLastBuild()
+if (lastBuild) {
+    println "Last build workspace: " + lastBuild.getWorkspace()?.getRemote()
+} else {
+    println "⚠️ No builds yet — run one build first so the workspace is created."
+}
