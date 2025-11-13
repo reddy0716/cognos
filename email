@@ -1,37 +1,33 @@
 import groovy.json.JsonSlurper
-import com.cloudbees.plugins.credentials.CredentialsProvider
-import com.cloudbees.plugins.credentials.common.StandardFileCredentials
+
+// Jenkins credential lookup via built-in classes
+def j = Jenkins.getInstance()
+def credsList = j.getExtensionList('com.cloudbees.plugins.credentials.SystemCredentialsProvider')[0]
+def allCreds = credsList.getStore().getCredentials(com.cloudbees.plugins.credentials.domains.Domain.global())
+def cred = allCreds.find { it.id == "cognos-credentials" }
+
+if (cred == null) {
+    return ["Credential 'cognos-credentials' not found in Jenkins"]
+}
 
 // ===== CONFIGURATION =====
 def MOTIO_SERVER = "https://cgrptmcip01.cloud.cammis.ca.gov"
-def SOURCE_ENV   = SOURCE_ENV ?: "Cognos-DEV/TEST"  // Parameter from dropdown
-def WORKSPACE    = "/var/lib/jenkins/MotioCI/CLI/combined-devops-cognos-deployments/MotioCI/api/CLI"
+def SOURCE_ENV   = SOURCE_ENV ?: "Cognos-DEV/TEST"
+def WORKSPACE    = "/var/lib/jenkins/combined-devops-cognos-deployments/MotioCI/api/CLI"
 def PYTHON       = "python3"
-def CRED_ID      = "cognos-credentials"  // Jenkins File credential containing credentials.json
 // ==========================
 
-def projects = []
+def results = []
 def TOKEN = ""
 
-// --- Retrieve Jenkins File Credential (credentials.json) ---
-def cred = CredentialsProvider.lookupCredentials(
-    StandardFileCredentials.class,
-    Jenkins.instance,
-    null,
-    null
-).find { it.id == CRED_ID }
 
-if (!cred) {
-    return ["Jenkins credential '${CRED_ID}' not found"]
-}
-
-// Write temporary credentials file
 def tmpCredFile = File.createTempFile("motio-cred-", ".json")
 tmpCredFile.deleteOnExit()
-tmpCredFile.bytes = cred.content
+tmpCredFile.bytes = cred.getContent()
+results << "Step1: Credential file created at ${tmpCredFile.absolutePath}"
+
 
 try {
-    // --- Login to MotioCI ---
     def loginCmd = [
         "bash", "-c",
         """
@@ -48,13 +44,17 @@ try {
     loginProc.waitFor()
 
     TOKEN = loginOut.toString().trim()
+    results << "Login STDOUT: ${loginOut.toString()}"
+    results << "Login STDERR: ${loginErr.toString()}"
 
     if (!TOKEN || TOKEN.length() < 10) {
-        println "[DEBUG] Login failed: ${loginErr.toString()}"
-        return ["Could not retrieve token — check credentials or MotioCI server."]
+        results << "Step2: Login failed — no valid token retrieved!"
+        tmpCredFile.delete()
+        return results
     }
 
-    // --- List Projects from MotioCI ---
+    results << "Step2: Token captured (${TOKEN.take(10)}...)"
+
     def listCmd = [
         "bash", "-c",
         """
@@ -71,25 +71,39 @@ try {
     listProc.waitFor()
 
     def raw = listOut.toString().trim()
+    results << "CLI STDOUT: ${raw.take(400)}"
+    results << "CLI STDERR: ${listErr.toString()}"
+
     if (!raw) {
-        println "[DEBUG] Empty response: ${listErr}"
-        return ["No projects found or access denied."]
+        results << "No projects returned — check env ${SOURCE_ENV}"
+        tmpCredFile.delete()
+        return results
     }
 
-    // --- Parse JSON output ---
-    def json = new JsonSlurper().parseText(raw)
-    def edges = json?.data?.instances?.edges ?: []
-    edges.each { e ->
-        e?.node?.projects?.edges?.each { p ->
-            def name = p?.node?.name
-            if (name) projects << name
+    try {
+        def json = new JsonSlurper().parseText(raw)
+        def edges = json?.data?.instances?.edges ?: []
+        def projects = []
+        edges.each { e ->
+            e?.node?.projects?.edges?.each { p ->
+                def name = p?.node?.name
+                if (name) projects << name
+            }
         }
+        if (projects.isEmpty()) {
+            results << "JSON parsed but no projects found"
+        } else {
+            results << "Found ${projects.size()} projects"
+            results.addAll(projects.unique().sort())
+        }
+    } catch (pe) {
+        results << "JSON parsing error: ${pe.message}"
     }
 
-    return projects.isEmpty() ? ["No projects found in ${SOURCE_ENV}"] : projects.unique().sort()
+    tmpCredFile.delete()
+    return results
 
 } catch (Exception e) {
-    return ["Error fetching projects: ${e.message}"]
-} finally {
     tmpCredFile.delete()
+    return ["Unexpected error: ${e.message}"]
 }
