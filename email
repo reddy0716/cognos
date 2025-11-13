@@ -1,7 +1,25 @@
+import org.jenkinsci.plugins.workflow.job.WorkflowJob
+import org.jenkinsci.plugins.workflow.job.WorkflowRun
+import org.jenkinsci.plugins.workflow.flow.FlowExecutionOwner
+
 def job = Jenkins.instance.getItemByFullName("Cognos Jobs/testing")
 def lastBuild = job?.getLastBuild()
+
 if (lastBuild) {
-    println "Last build workspace: " + lastBuild.getWorkspace()?.getRemote()
+    def workspacePath = null
+    lastBuild.getExecution().getOwners().each { owner ->
+        if (owner instanceof FlowExecutionOwner.Executable) {
+            try {
+                workspacePath = owner.getExecutable().getAction(hudson.model.WorkspaceAction)?.getWorkspace()?.getRemote()
+            } catch (ignore) {}
+        }
+    }
+
+    if (workspacePath) {
+        println "Workspace path: ${workspacePath}"
+    } else {
+        println "Could not resolve workspace automatically — run a build first or check agent."
+    }
 } else {
-    println "⚠️ No builds yet — run one build first so the workspace is created."
+    println "No builds yet — run one build first so the workspace is created."
 }
