@@ -1,9 +1,16 @@
 import groovy.json.JsonSlurper
-import jenkins.model.*                                   // Jenkins core class
-import com.cloudbees.plugins.credentials.*               // Credentials plugin root
-import com.cloudbees.plugins.credentials.domains.*       // Domain
-import com.cloudbees.plugins.credentials.impl.*          // File credentials
-import hudson.util.*                                     // Utilities
+import jenkins.model.*
+import com.cloudbees.plugins.credentials.*
+import com.cloudbees.plugins.credentials.domains.*
+import com.cloudbees.plugins.credentials.impl.*
+import hudson.util.*
+
+/*
+  MotioCI CLI Dynamic Project Loader with Full Debugging
+  ------------------------------------------------------
+  This version avoids File.bytes (uses OutputStream)
+  and prints detailed output for each step.
+*/
 
 // ===== CONFIGURATION =====
 def MOTIO_SERVER = "https://cgrptmcip01.cloud.cammis.ca.gov"
@@ -17,7 +24,7 @@ def results = []
 def TOKEN = ""
 
 try {
-    // --- Step 1️⃣ Get Jenkins Credential Object ---
+    // --- Step 1️⃣ Look up Jenkins Credential ---
     results << "🔍 Step1: Looking up Jenkins credential '${CRED_ID}'..."
     def j = Jenkins.getInstance()
     def credsList = j.getExtensionList('com.cloudbees.plugins.credentials.SystemCredentialsProvider')[0]
@@ -28,16 +35,17 @@ try {
         results << "❌ Step1: Credential '${CRED_ID}' not found!"
         return results
     }
+    results << "✅ Step1: Credential located successfully."
 
-    results << "✅ Step1: Credential located successfully (${cred.id})"
-
-    // --- Step 2️⃣ Create temporary credentials file ---
+    // --- Step 2️⃣ Write credential content to temp file ---
     def tmpCredFile = File.createTempFile("motio-cred-", ".json")
     tmpCredFile.deleteOnExit()
-    tmpCredFile.bytes = cred.getContent()
-    results << "✅ Step2: Temporary credentials file created at ${tmpCredFile.absolutePath}"
+    def fos = new FileOutputStream(tmpCredFile)
+    fos.write(cred.getContent())
+    fos.close()
+    results << "✅ Step2: Temporary credentials.json created at ${tmpCredFile.absolutePath}"
 
-    // --- Step 3️⃣ Verify CLI Path ---
+    // --- Step 3️⃣ Verify CLI path ---
     def cliFile = new File("${WORKSPACE}/ci-cli.py")
     if (!cliFile.exists()) {
         results << "❌ Step3: CLI file not found at ${cliFile.absolutePath}"
@@ -46,7 +54,7 @@ try {
     }
     results << "✅ Step3: CLI located successfully at ${cliFile.absolutePath}"
 
-    // --- Step 4️⃣ Run login ---
+    // --- Step 4️⃣ Run login command ---
     results << "🔍 Step4: Running login command..."
     def loginCmd = [
         "bash", "-c",
@@ -73,11 +81,10 @@ try {
         tmpCredFile.delete()
         return results
     }
+    results << "✅ Step4: Token retrieved successfully (${TOKEN.take(10)}...)"
 
-    results << "✅ Step4: Token captured successfully (${TOKEN.take(10)}...)"
-
-    // --- Step 5️⃣ List projects ---
-    results << "🔍 Step5: Fetching projects from MotioCI..."
+    // --- Step 5️⃣ Run project listing ---
+    results << "🔍 Step5: Fetching projects..."
     def listCmd = [
         "bash", "-c",
         """
@@ -105,9 +112,9 @@ try {
         return results
     }
 
-    // --- Step 6️⃣ Parse JSON ---
+    // --- Step 6️⃣ Parse JSON response ---
     try {
-        results << "🔍 Step6: Parsing JSON response..."
+        results << "🔍 Step6: Parsing JSON output..."
         def json = new JsonSlurper().parseText(raw)
         def edges = json?.data?.instances?.edges ?: []
         def projects = []
@@ -126,12 +133,11 @@ try {
         }
     } catch (Exception pe) {
         results << "❌ Step6: JSON parsing error — ${pe.message}"
-        results << "⚠️ Raw JSON snippet:\n${raw.take(500)}"
+        results << "⚠️ Raw JSON:\n${raw.take(500)}"
     }
 
     tmpCredFile.delete()
-    results << "✅ Cleanup complete: temporary credentials removed."
-
+    results << "✅ Cleanup complete: Temporary credentials removed."
     return results
 
 } catch (Exception e) {
