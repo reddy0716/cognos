@@ -1,145 +1,88 @@
-import groovy.json.JsonSlurper
-import jenkins.model.*
-import com.cloudbees.plugins.credentials.*
-import com.cloudbees.plugins.credentials.domains.*
-import com.cloudbees.plugins.credentials.impl.*
-import hudson.util.*
+stage('Prepare deployment') {
+  when { expression { return !params.ROLLBACK_LABEL?.trim() } }
+  steps {
+    container('python') {
+      sh '''
+        set -e
+        cd MotioCI/api/CLI
 
-/*
-  MotioCI CLI Dynamic Project Loader with Full Debugging
-  ------------------------------------------------------
-  This version avoids File.bytes (uses OutputStream)
-  and prints detailed output for each step.
-*/
+        TOKEN=$(cat ../token.txt)
+        echo "Using MotioCI token (length: ${#TOKEN})"
 
-// ===== CONFIGURATION =====
-def MOTIO_SERVER = "https://cgrptmcip01.cloud.cammis.ca.gov"
-def SOURCE_ENV   = SOURCE_ENV ?: "Cognos-DEV/TEST"
-def WORKSPACE    = "/var/lib/jenkins/combined-devops-cognos-deployments/MotioCI/api/CLI"
-def PYTHON       = "python3"
-def CRED_ID      = "cognos-credentials"
-// ==========================
+        if [ -z "${OBJECT_PATH}" ]; then
+          echo "ERROR: OBJECT_PATH not provided!"
+          exit 1
+        fi
+        echo "OBJECT_PATH: ${OBJECT_PATH}"
 
-def results = []
-def TOKEN = ""
+        echo "Discovering versioned items in project ${PROJECT_NAME} ..."
+        python3 ci-cli.py --server="$MOTIO_SERVER" \
+          versionedItems ls \
+          --xauthtoken "$TOKEN" \
+          --instanceName "${SOURCE_ENV}" \
+          --projectName "${PROJECT_NAME}" \
+          --currentOnly True > items_full.out
 
-try {
-    // --- Step 1️⃣ Look up Jenkins Credential ---
-    results << "🔍 Step1: Looking up Jenkins credential '${CRED_ID}'..."
-    def j = Jenkins.getInstance()
-    def credsList = j.getExtensionList('com.cloudbees.plugins.credentials.SystemCredentialsProvider')[0]
-    def allCreds = credsList.getStore().getCredentials(Domain.global())
-    def cred = allCreds.find { it.id == CRED_ID }
+        echo "Total items listed (raw): $(grep -c \"'id':\" items_full.out || true)"
 
-    if (!cred) {
-        results << "❌ Step1: Credential '${CRED_ID}' not found!"
-        return results
+        echo "Filtering for path: ${OBJECT_PATH}"
+        grep -A8 "prettyPath.: '${OBJECT_PATH}'" items_full.out > items.out || true
+
+
+        grep "'id':" items.out | grep -v "instanceId" | grep -o "[0-9][0-9]*" | paste -sd, - > ids.txt || true
+        IDS=$(cat ids.txt || true)
+
+        if [ -z "$IDS" ]; then
+          echo "ERROR: No versioned items found exactly at ${OBJECT_PATH}"
+          echo "Hint: Check if object is versioned or spelling of path."
+          exit 1
+        fi
+
+        echo "Matched IDs: $IDS"
+        ID_COUNT=$(echo $IDS | tr ',' '\\n' | wc -l | tr -d ' ')
+        echo "Number of matching items: $ID_COUNT"
+
+        echo "Matched object path(s):"
+        grep "prettyPath" items.out
+
+
+        if [ "${AUTO_LABEL}" = "true" ]; then
+          PRE_LABEL="PreDeploy_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
+          echo "Creating Pre-Deployment Label: $PRE_LABEL"
+          python3 ci-cli.py --server="$MOTIO_SERVER" label create \
+            --xauthtoken "$TOKEN" \
+            --instanceName "${SOURCE_ENV}" \
+            --projectName "${PROJECT_NAME}" \
+            --name "$PRE_LABEL"
+        fi
+
+        VERSION_NAME="AutoLabel_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
+        echo "Creating Deployment Label: $VERSION_NAME with IDs [$IDS]"
+        python3 ci-cli.py --server="$MOTIO_SERVER" label create \
+          --xauthtoken "$TOKEN" \
+          --instanceName "${SOURCE_ENV}" \
+          --projectName "${PROJECT_NAME}" \
+          --name "$VERSION_NAME" \
+          --versionedItemIds "[$IDS]"
+
+        python3 ci-cli.py --server="$MOTIO_SERVER" label ls \
+          --xauthtoken "$TOKEN" \
+          --instanceName "${SOURCE_ENV}" \
+          --projectName "${PROJECT_NAME}" \
+          --labelName "$VERSION_NAME" > label_info.out
+
+        LABEL_ID=$(python3 -c "import ast; data=open('label_info.out').read(); parsed=ast.literal_eval(data); print(parsed['data']['instances']['edges'][0]['node']['projects']['edges'][0]['node']['labels']['edges'][0]['node']['id'])" 2>/dev/null || echo "")
+        echo "$LABEL_ID" > ../label_id.txt
+        echo "Label $VERSION_NAME (ID: $LABEL_ID) created successfully."
+
+        echo "Verifying label contents ..."
+        python3 ci-cli.py --server="$MOTIO_SERVER" label ls \
+          --xauthtoken "$TOKEN" \
+          --instanceName "${SOURCE_ENV}" \
+          --projectName "${PROJECT_NAME}" \
+          --labelName "$VERSION_NAME" > label_verify.out
+        grep "prettyPath" label_verify.out || echo "(no paths found)"
+      '''
     }
-    results << "✅ Step1: Credential located successfully."
-
-    // --- Step 2️⃣ Write credential content to temp file ---
-    def tmpCredFile = File.createTempFile("motio-cred-", ".json")
-    tmpCredFile.deleteOnExit()
-    def fos = new FileOutputStream(tmpCredFile)
-    fos.write(cred.getContent())
-    fos.close()
-    results << "✅ Step2: Temporary credentials.json created at ${tmpCredFile.absolutePath}"
-
-    // --- Step 3️⃣ Verify CLI path ---
-    def cliFile = new File("${WORKSPACE}/ci-cli.py")
-    if (!cliFile.exists()) {
-        results << "❌ Step3: CLI file not found at ${cliFile.absolutePath}"
-        tmpCredFile.delete()
-        return results
-    }
-    results << "✅ Step3: CLI located successfully at ${cliFile.absolutePath}"
-
-    // --- Step 4️⃣ Run login command ---
-    results << "🔍 Step4: Running login command..."
-    def loginCmd = [
-        "bash", "-c",
-        """
-        cd ${WORKSPACE} &&
-        ${PYTHON} ci-cli.py --server=${MOTIO_SERVER} \
-          login --credentialsFile ${tmpCredFile.absolutePath}
-        """
-    ]
-    results << "🧠 Executing: ${loginCmd.join(' ')}"
-
-    def loginProc = loginCmd.execute()
-    def loginOut = new StringBuffer()
-    def loginErr = new StringBuffer()
-    loginProc.consumeProcessOutput(loginOut, loginErr)
-    loginProc.waitFor()
-
-    results << "🔹 Login STDOUT:\n${loginOut.toString()}"
-    results << "🔹 Login STDERR:\n${loginErr.toString()}"
-
-    TOKEN = loginOut.toString().find(/[A-Za-z0-9._-]{20,}/)
-    if (!TOKEN || TOKEN.length() < 10) {
-        results << "❌ Step4: Login failed — token not found!"
-        tmpCredFile.delete()
-        return results
-    }
-    results << "✅ Step4: Token retrieved successfully (${TOKEN.take(10)}...)"
-
-    // --- Step 5️⃣ Run project listing ---
-    results << "🔍 Step5: Fetching projects..."
-    def listCmd = [
-        "bash", "-c",
-        """
-        cd ${WORKSPACE} &&
-        ${PYTHON} ci-cli.py --server=${MOTIO_SERVER} \
-          project ls --xauthtoken ${TOKEN} \
-          --instanceName ${SOURCE_ENV}
-        """
-    ]
-    results << "🧠 Executing: ${listCmd.join(' ')}"
-
-    def listProc = listCmd.execute()
-    def listOut = new StringBuffer()
-    def listErr = new StringBuffer()
-    listProc.consumeProcessOutput(listOut, listErr)
-    listProc.waitFor()
-
-    def raw = listOut.toString().trim()
-    results << "🔹 CLI STDOUT (first 400 chars):\n${raw.take(400)}"
-    results << "🔹 CLI STDERR:\n${listErr.toString()}"
-
-    if (!raw) {
-        results << "⚠️ Step5: CLI returned empty output — token or env invalid?"
-        tmpCredFile.delete()
-        return results
-    }
-
-    // --- Step 6️⃣ Parse JSON response ---
-    try {
-        results << "🔍 Step6: Parsing JSON output..."
-        def json = new JsonSlurper().parseText(raw)
-        def edges = json?.data?.instances?.edges ?: []
-        def projects = []
-        edges.each { e ->
-            e?.node?.projects?.edges?.each { p ->
-                def name = p?.node?.name
-                if (name) projects << name
-            }
-        }
-
-        if (projects.isEmpty()) {
-            results << "⚠️ Step6: JSON parsed but no projects found."
-        } else {
-            results << "✅ Step6: Parsed successfully — ${projects.size()} projects found."
-            results.addAll(projects.unique().sort())
-        }
-    } catch (Exception pe) {
-        results << "❌ Step6: JSON parsing error — ${pe.message}"
-        results << "⚠️ Raw JSON:\n${raw.take(500)}"
-    }
-
-    tmpCredFile.delete()
-    results << "✅ Cleanup complete: Temporary credentials removed."
-    return results
-
-} catch (Exception e) {
-    return ["❌ Unexpected error: ${e.message}", e.toString()]
+  }
 }
