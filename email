@@ -1,88 +1,126 @@
-stage('Prepare deployment') {
-  when { expression { return !params.ROLLBACK_LABEL?.trim() } }
-  steps {
-    container('python') {
-      sh '''
-        set -e
-        cd MotioCI/api/CLI
 
-        TOKEN=$(cat ../token.txt)
-        echo "Using MotioCI token (length: ${#TOKEN})"
-
-        echo "Project: ${PROJECT_NAME}"
-        echo "Object Path: ${OBJECT_PATH:-<none>}"
-
-        # List all versioned items for the project
-        echo "Discovering versioned items in project ${PROJECT_NAME}..."
-        python3 ci-cli.py --server="$MOTIO_SERVER" \
-          versionedItems ls \
-          --xauthtoken "$TOKEN" \
-          --instanceName "${SOURCE_ENV}" \
-          --projectName "${PROJECT_NAME}" > items_full.out
-
-        echo "Total items listed (raw): $(grep -c \"'id':\" items_full.out || true)"
-
-        # ------------------------------------------------------------
-        # Determine which IDs to label (whole project vs. specific path)
-        # ------------------------------------------------------------
-        if [ -z "${OBJECT_PATH}" ]; then
-          echo "No OBJECT_PATH provided — deploying the entire project ${PROJECT_NAME}"
-          grep "'id':" items_full.out | grep -v "instanceId" | grep -o "[0-9][0-9]*" \
-            | paste -sd, - > ids.txt || true
-        else
-          echo "Filtering for path: ${OBJECT_PATH}"
-          grep -A8 "prettyPath.: '${OBJECT_PATH}'" items_full.out > items.out || true
-          grep "'id':" items.out | grep -v "instanceId" | grep -o "[0-9][0-9]*" \
-            | paste -sd, - > ids.txt || true
-        fi
-
-        IDS=$(cat ids.txt || true)
-
-        if [ -z "$IDS" ]; then
-          echo "ERROR: No versioned items found for selection."
-          echo "Hint: Check if the object is versioned or the path is correct."
-          exit 1
-        fi
-
-        ID_COUNT=$(echo $IDS | tr ',' '\\n' | wc -l | tr -d ' ')
-        echo "Found ${ID_COUNT} versioned item(s)."
-        echo "Matched IDs: $IDS"
-
-        # ------------------------------------------------------------
-        # Create Deployment label for identified IDs
-        # ------------------------------------------------------------
-        VERSION_NAME="AutoLabel_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
-        echo "Creating Deployment Label: $VERSION_NAME with IDs [$IDS]"
-        python3 ci-cli.py --server="$MOTIO_SERVER" label create \
-          --xauthtoken "$TOKEN" \
-          --instanceName "${SOURCE_ENV}" \
-          --projectName "${PROJECT_NAME}" \
-          --name "$VERSION_NAME" \
-          --versionedItemIds "[$IDS]"
-
-        # ------------------------------------------------------------
-        # Fetch and store Label ID
-        # ------------------------------------------------------------
-        python3 ci-cli.py --server="$MOTIO_SERVER" label ls \
-          --xauthtoken "$TOKEN" \
-          --instanceName "${SOURCE_ENV}" \
-          --projectName "${PROJECT_NAME}" \
-          --labelName "$VERSION_NAME" > label_info.out
-
-        LABEL_ID=$(python3 -c "import ast; data=open('label_info.out').read(); \
-          parsed=ast.literal_eval(data); \
-          print(parsed['data']['instances']['edges'][0]['node']['projects']['edges'][0]['node']['labels']['edges'][0]['node']['id'])" \
-          2>/dev/null || echo "")
-
-        if [ -z "$LABEL_ID" ]; then
-          echo "ERROR: Unable to retrieve label ID!"
-          exit 1
-        fi
-
-        echo "$LABEL_ID" > ../label_id.txt
-        echo "Label $VERSION_NAME (ID: $LABEL_ID) created successfully."
-
-      '''
-    }
+  environment {
+    GIT_BRANCH   = "${BRANCH_NAME}"
+    MOTIO_SERVER = "https://cgrptmcip01.cloud.cammis.ca.gov"
   }
-}
+
+  parameters {
+    choice(name: 'SOURCE_ENV', choices: ['Cognos-DEV/TEST', 'Cognos-SIT', 'Cognos-UAT'], description: 'Select the Cognos source environment.')
+    choice(name: 'TARGET_ENV', choices: ['Cognos-SIT', 'Cognos-UAT', 'Cognos-PRD'], description: 'Select the target Cognos environment.')
+    string(name: 'PROJECT_NAME', defaultValue: '', description: 'MotioCI project name (manual entry if not auto-listed).')
+    string(name: 'OBJECT_PATH', defaultValue: '', description: 'Cognos path to promote (leave empty to deploy whole project).')
+    booleanParam(name: 'AUTO_LABEL', defaultValue: true, description: 'Create Pre/Post deployment labels automatically.')
+    string(name: 'ROLLBACK_LABEL', defaultValue: '', description: 'Optional: enter label to redeploy.')
+  }
+
+  options {
+    disableConcurrentBuilds()
+    timestamps()
+  }
+
+  stages {
+
+    /* -----------------------------------------------------------------------
+       1. INITIALIZE
+    ----------------------------------------------------------------------- */
+    stage('Initialize') {
+      steps {
+        script {
+          echo """
+          ================================================
+          MotioCI → Cognos Deployment Pipeline Initialized
+          ================================================
+          Source:   ${params.SOURCE_ENV}
+          Target:   ${params.TARGET_ENV}
+          Project:  ${params.PROJECT_NAME ?: '(not set)'}
+          Path:     ${params.OBJECT_PATH ?: '(full project)'}
+          Rollback: ${params.ROLLBACK_LABEL ?: 'N/A'}
+          ================================================
+          """
+        }
+      }
+    }
+
+    /* -----------------------------------------------------------------------
+       2. MOTIOCI LOGIN
+    ----------------------------------------------------------------------- */
+    stage('MotioCI Login') {
+      steps {
+        withCredentials([file(credentialsId: 'cognos-credentials', variable: 'CREDENTIALS_FILE')]) {
+          container('python') {
+            sh '''
+              set -euo pipefail
+              cd MotioCI/api/CLI
+
+              echo "🔧 Installing MotioCI CLI dependencies..."
+              python3 -m pip install --user -r requirements.txt
+
+              echo "🔐 Logging in to MotioCI..."
+              python3 ci-cli.py --server="$MOTIO_SERVER" \
+                login --credentialsFile "$CREDENTIALS_FILE" > login.out 2>&1 || true
+
+              awk 'match($0,/(Auth[[:space:]]*[Tt]oken|x-auth_token|xauthtoken)[[:space:]]*[:=][[:space:]]*([A-Za-z0-9._-]+)/,m){print m[2]}' login.out | tail -n1 > ../token.txt || true
+              TOKEN=$(cat ../token.txt 2>/dev/null || true)
+
+              if [ -z "$TOKEN" ] || [ "${#TOKEN}" -lt 10 ]; then
+                echo "❌ ERROR: Failed to capture MotioCI token!"
+                cat login.out
+                exit 1
+              fi
+
+              echo "✅ Login successful. Token length: ${#TOKEN}"
+            '''
+
+            // === Dynamic discovery: projects and folders ===
+            script {
+              echo "🔍 Fetching available MotioCI projects for ${params.SOURCE_ENV}..."
+
+              sh '''
+                set -e
+                cd MotioCI/api/CLI
+                python3 ci-cli.py --server="$MOTIO_SERVER" project ls \
+                  --xauthtoken "$(cat ../token.txt)" \
+                  --instanceName "${SOURCE_ENV}" > ../projects.json
+
+                grep -o "'name': '[^']*'" ../projects.json | cut -d"'" -f4 | sort | uniq > ../projects.txt
+              '''
+
+              def projects = readFile('MotioCI/projects.txt').split('\n').findAll { it?.trim() }
+              echo "✅ Found ${projects.size()} projects."
+
+              // Dynamically update PROJECT_NAME choices for next run
+              def job = Jenkins.instance.getItemByFullName(env.JOB_NAME)
+              def prop = job.getProperty(ParametersDefinitionProperty)
+              def newParams = [
+                new ChoiceParameterDefinition('PROJECT_NAME', projects as String[], 'Select MotioCI Project')
+              ]
+              prop.parameterDefinitions.removeAll { it.name == 'PROJECT_NAME' }
+              prop.parameterDefinitions.addAll(newParams)
+              job.save()
+              echo "PROJECT_NAME dropdown updated for next build."
+
+              // Optional: also fetch folders for current project
+              if (params.PROJECT_NAME?.trim()) {
+                echo "Fetching folders for project ${params.PROJECT_NAME}..."
+                sh '''
+                  cd MotioCI/api/CLI
+                  python3 ci-cli.py --server="$MOTIO_SERVER" versionedItems ls \
+                    --xauthtoken "$(cat ../token.txt)" \
+                    --instanceName "${SOURCE_ENV}" \
+                    --projectName "${PROJECT_NAME}" --currentOnly True > ../folders.json
+                  grep "prettyPath" ../folders.json | cut -d"'" -f4 | sort | uniq > ../folders.txt
+                '''
+                def folders = readFile('MotioCI/folders.txt').split('\n').findAll { it?.trim() }
+                echo "Found ${folders.size()} folder paths."
+                prop.parameterDefinitions.removeAll { it.name == 'OBJECT_PATH' }
+                prop.parameterDefinitions.add(new ChoiceParameterDefinition('OBJECT_PATH', folders as String[], 'Select folder or report path'))
+                job.save()
+                echo "OBJECT_PATH dropdown updated for next build."
+              } else {
+                echo "Skipping folder discovery (no project selected yet)."
+              }
+            }
+          }
+        }
+      }
+    }
