@@ -9,53 +9,48 @@ stage('Prepare deployment') {
         TOKEN=$(cat ../token.txt)
         echo "Using MotioCI token (length: ${#TOKEN})"
 
-        if [ -z "${OBJECT_PATH}" ]; then
-          echo "ERROR: OBJECT_PATH not provided!"
-          exit 1
-        fi
-        echo "OBJECT_PATH: ${OBJECT_PATH}"
+        echo "Project: ${PROJECT_NAME}"
+        echo "Object Path: ${OBJECT_PATH:-<none>}"
 
-        echo "Discovering versioned items in project ${PROJECT_NAME} ..."
+        # List all versioned items for the project
+        echo "Discovering versioned items in project ${PROJECT_NAME}..."
         python3 ci-cli.py --server="$MOTIO_SERVER" \
           versionedItems ls \
           --xauthtoken "$TOKEN" \
           --instanceName "${SOURCE_ENV}" \
-          --projectName "${PROJECT_NAME}" \
-          --currentOnly True > items_full.out
+          --projectName "${PROJECT_NAME}" > items_full.out
 
         echo "Total items listed (raw): $(grep -c \"'id':\" items_full.out || true)"
 
-        echo "Filtering for path: ${OBJECT_PATH}"
-        grep -A8 "prettyPath.: '${OBJECT_PATH}'" items_full.out > items.out || true
+        # ------------------------------------------------------------
+        # Determine which IDs to label (whole project vs. specific path)
+        # ------------------------------------------------------------
+        if [ -z "${OBJECT_PATH}" ]; then
+          echo "No OBJECT_PATH provided — deploying the entire project ${PROJECT_NAME}"
+          grep "'id':" items_full.out | grep -v "instanceId" | grep -o "[0-9][0-9]*" \
+            | paste -sd, - > ids.txt || true
+        else
+          echo "Filtering for path: ${OBJECT_PATH}"
+          grep -A8 "prettyPath.: '${OBJECT_PATH}'" items_full.out > items.out || true
+          grep "'id':" items.out | grep -v "instanceId" | grep -o "[0-9][0-9]*" \
+            | paste -sd, - > ids.txt || true
+        fi
 
-
-        grep "'id':" items.out | grep -v "instanceId" | grep -o "[0-9][0-9]*" | paste -sd, - > ids.txt || true
         IDS=$(cat ids.txt || true)
 
         if [ -z "$IDS" ]; then
-          echo "ERROR: No versioned items found exactly at ${OBJECT_PATH}"
-          echo "Hint: Check if object is versioned or spelling of path."
+          echo "ERROR: No versioned items found for selection."
+          echo "Hint: Check if the object is versioned or the path is correct."
           exit 1
         fi
 
-        echo "Matched IDs: $IDS"
         ID_COUNT=$(echo $IDS | tr ',' '\\n' | wc -l | tr -d ' ')
-        echo "Number of matching items: $ID_COUNT"
+        echo "Found ${ID_COUNT} versioned item(s)."
+        echo "Matched IDs: $IDS"
 
-        echo "Matched object path(s):"
-        grep "prettyPath" items.out
-
-
-        if [ "${AUTO_LABEL}" = "true" ]; then
-          PRE_LABEL="PreDeploy_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
-          echo "Creating Pre-Deployment Label: $PRE_LABEL"
-          python3 ci-cli.py --server="$MOTIO_SERVER" label create \
-            --xauthtoken "$TOKEN" \
-            --instanceName "${SOURCE_ENV}" \
-            --projectName "${PROJECT_NAME}" \
-            --name "$PRE_LABEL"
-        fi
-
+        # ------------------------------------------------------------
+        # Create Deployment label for identified IDs
+        # ------------------------------------------------------------
         VERSION_NAME="AutoLabel_${BUILD_NUMBER}_$(date +%Y%m%d_%H%M)"
         echo "Creating Deployment Label: $VERSION_NAME with IDs [$IDS]"
         python3 ci-cli.py --server="$MOTIO_SERVER" label create \
@@ -65,23 +60,28 @@ stage('Prepare deployment') {
           --name "$VERSION_NAME" \
           --versionedItemIds "[$IDS]"
 
+        # ------------------------------------------------------------
+        # Fetch and store Label ID
+        # ------------------------------------------------------------
         python3 ci-cli.py --server="$MOTIO_SERVER" label ls \
           --xauthtoken "$TOKEN" \
           --instanceName "${SOURCE_ENV}" \
           --projectName "${PROJECT_NAME}" \
           --labelName "$VERSION_NAME" > label_info.out
 
-        LABEL_ID=$(python3 -c "import ast; data=open('label_info.out').read(); parsed=ast.literal_eval(data); print(parsed['data']['instances']['edges'][0]['node']['projects']['edges'][0]['node']['labels']['edges'][0]['node']['id'])" 2>/dev/null || echo "")
+        LABEL_ID=$(python3 -c "import ast; data=open('label_info.out').read(); \
+          parsed=ast.literal_eval(data); \
+          print(parsed['data']['instances']['edges'][0]['node']['projects']['edges'][0]['node']['labels']['edges'][0]['node']['id'])" \
+          2>/dev/null || echo "")
+
+        if [ -z "$LABEL_ID" ]; then
+          echo "ERROR: Unable to retrieve label ID!"
+          exit 1
+        fi
+
         echo "$LABEL_ID" > ../label_id.txt
         echo "Label $VERSION_NAME (ID: $LABEL_ID) created successfully."
 
-        echo "Verifying label contents ..."
-        python3 ci-cli.py --server="$MOTIO_SERVER" label ls \
-          --xauthtoken "$TOKEN" \
-          --instanceName "${SOURCE_ENV}" \
-          --projectName "${PROJECT_NAME}" \
-          --labelName "$VERSION_NAME" > label_verify.out
-        grep "prettyPath" label_verify.out || echo "(no paths found)"
       '''
     }
   }
