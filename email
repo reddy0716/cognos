@@ -1,128 +1,179 @@
-properties([
-  parameters([
+stage('Initialize') {
+      steps {
+        script {
+          properties([
+            parameters([
 
-    //Source Environment
-    [
-      $class: 'ChoiceParameter',
-      choiceType: 'PT_SINGLE_SELECT',
-      name: 'SOURCE_ENV',
-      description: 'Select Cognos Source Environment',
-      script: [
-        $class: 'GroovyScript',
-        fallbackScript: [
-          classpath: [], sandbox: true,
-          script: "return ['Error loading environments']"
-        ],
-        script: [
-          classpath: [], sandbox: true,
-          script: """
-            return ['Cognos-DEV/TEST', 'Cognos-SIT', 'Cognos-UAT']
+              // Source Environment
+              [
+                $class: 'ChoiceParameter',
+                choiceType: 'PT_SINGLE_SELECT',
+                name: 'SOURCE_ENV',
+                description: 'Select Cognos Source Environment',
+                script: [
+                  $class: 'GroovyScript',
+                  fallbackScript: [classpath: [], sandbox: true, script: "return ['Error loading environments']"],
+                  script: [classpath: [], sandbox: true, script: "return ['Cognos-DEV/TEST', 'Cognos-SIT', 'Cognos-UAT']"]
+                ]
+              ],
+
+              // Target Environment (Reactive)
+              [
+                $class: 'CascadeChoiceParameter',
+                choiceType: 'PT_SINGLE_SELECT',
+                name: 'TARGET_ENV',
+                description: 'Select Target Cognos Environment',
+                referencedParameters: 'SOURCE_ENV',
+                script: [
+                  $class: 'GroovyScript',
+                  fallbackScript: [classpath: [], sandbox: true, script: "return ['Error loading targets']"],
+                  script: [classpath: [], sandbox: true, script: """
+                    if (SOURCE_ENV == 'Cognos-DEV/TEST') return ['Cognos-SIT','Cognos-UAT','Cognos-PRD']
+                    else if (SOURCE_ENV == 'Cognos-SIT') return ['Cognos-UAT','Cognos-PRD']
+                    else return ['Cognos-PRD']
+                  """]
+                ]
+              ],
+
+              // Dynamic Project List (reads from projects.txt)
+              [
+                $class: 'ChoiceParameter',
+                choiceType: 'PT_SINGLE_SELECT',
+                name: 'PROJECT_NAME',
+                description: 'Select MotioCI Project (auto-loaded after login)',
+                script: [
+                  $class: 'GroovyScript',
+                  fallbackScript: [classpath: [], sandbox: true, script: "return ['(Run MotioCI Login once to fetch projects)']"],
+                  script: [classpath: [], sandbox: true, script: """
+                    import java.nio.file.*
+                    def f = new File("${WORKSPACE}/projects.txt")
+                    if (f.exists()) {
+                      def lines = f.readLines().findAll { it?.trim() }
+                      if (lines) return lines
+                      else return ['(No projects found — rerun login)']
+                    } else {
+                      return ['(projects.txt not found — run MotioCI Login stage first)']
+                    }
+                  """]
+                ]
+              ],
+
+              // Dynamic Folder List (reads from folders.txt)
+              [
+                $class: 'CascadeChoiceParameter',
+                choiceType: 'PT_SINGLE_SELECT',
+                name: 'OBJECT_PATH',
+                description: 'Select Folder or Report Path (auto-loaded from folders.txt)',
+                referencedParameters: 'PROJECT_NAME',
+                script: [
+                  $class: 'GroovyScript',
+                  fallbackScript: [classpath: [], sandbox: true, script: "return ['(No folders found)']"],
+                  script: [classpath: [], sandbox: true, script: """
+                    import java.nio.file.*
+                    def f = new File("${WORKSPACE}/folders.txt")
+                    if (f.exists()) {
+                      def lines = f.readLines().findAll { it?.trim() }
+                      if (lines) return lines
+                      else return ['(Empty — rerun login)']
+                    } else {
+                      return ['(folders.txt not found — run MotioCI Login)']
+                    }
+                  """]
+                ]
+              ],
+
+              // Manual overrides
+              [
+                $class: 'DynamicReferenceParameter',
+                name: 'PROJECT_NAME',
+                description: 'Enter project manually if not listed',
+                defaultValue: ''
+              ],
+              [
+                $class: 'DynamicReferenceParameter',
+                name: 'OBJECT_PATH',
+                description: 'Enter folder path manually if not listed',
+                defaultValue: ''
+              ],
+              [
+                $class: 'StringParameterDefinition',
+                name: 'ROLLBACK_LABEL',
+                defaultValue: '',
+                description: 'Enter existing label name to redeploy'
+              ]
+            ])
+          ])
+
+          echo """
+          ================================================
+          MotioCI → Cognos Deployment Pipeline Initialized
+          ================================================
+          Source: ${params.SOURCE_ENV}
+          Target: ${params.TARGET_ENV}
+          Project: ${params.PROJECT_NAME}
+          Path: ${params.OBJECT_PATH}
+          Rollback Label: ${params.ROLLBACK_LABEL ?: "N/A"}
+          ================================================
           """
-        ]
-      ]
-    ],
+        }
+      }
+    }
 
-    //Target Environment (Reactive)
-    [
-      $class: 'CascadeChoiceParameter',
-      choiceType: 'PT_SINGLE_SELECT',
-      name: 'TARGET_ENV',
-      description: 'Select Target Cognos Environment',
-      referencedParameters: 'SOURCE_ENV',
-      script: [
-        $class: 'GroovyScript',
-        fallbackScript: [
-          classpath: [], sandbox: true,
-          script: "return ['Error loading targets']"
-        ],
-        script: [
-          classpath: [], sandbox: true,
-          script: """
-            if (SOURCE_ENV == 'Cognos-DEV/TEST') return ['Cognos-SIT','Cognos-UAT','Cognos-PRD']
-            else if (SOURCE_ENV == 'Cognos-SIT') return ['Cognos-UAT','Cognos-PRD']
-            else return ['Cognos-PRD']
-          """
-        ]
-      ]
-    ],
+    stage('MotioCI Login') {
+      steps {
+        withCredentials([file(credentialsId: 'cognos-credentials', variable: 'CREDENTIALS_FILE')]) {
+          container('python') {
+            sh '''
+              set -euo pipefail
+              cd MotioCI/api/CLI
 
-    //Dynamic Project List (from projects.txt)
-    [
-      $class: 'ChoiceParameter',
-      choiceType: 'PT_SINGLE_SELECT',
-      name: 'PROJECT_NAME',
-      description: 'Select MotioCI Project (auto-loaded after first login)',
-      script: [
-        $class: 'GroovyScript',
-        fallbackScript: [
-          classpath: [], sandbox: true,
-          script: "return ['(Run MotioCI Login once to fetch projects)']"
-        ],
-        script: [
-          classpath: [], sandbox: true,
-          script: """
-            import java.nio.file.*
-            def f = new File("${WORKSPACE}/projects.txt")
-            if (f.exists()) {
-              def lines = f.readLines().findAll { it?.trim() }
-              if (lines) return lines
-              else return ['(No projects found — rerun login)']
-            } else {
-              return ['(projects.txt not found — run MotioCI Login stage first)']
-            }
-          """
-        ]
-      ]
-    ],
+              echo "🔧 Installing MotioCI CLI dependencies..."
+              python3 -m pip install --user -r requirements.txt
 
-    //Dynamic Folder List (depends on Project)
-    [
-      $class: 'CascadeChoiceParameter',
-      choiceType: 'PT_SINGLE_SELECT',
-      name: 'OBJECT_PATH',
-      description: 'Select Folder or Report Path (auto-loaded from folders.txt)',
-      referencedParameters: 'PROJECT_NAME',
-      script: [
-        $class: 'GroovyScript',
-        fallbackScript: [
-          classpath: [], sandbox: true,
-          script: "return ['(No folders found)']"
-        ],
-        script: [
-          classpath: [], sandbox: true,
-          script: """
-            import java.nio.file.*
-            def f = new File("${WORKSPACE}/folders.txt")
-            if (f.exists()) {
-              def lines = f.readLines().findAll { it?.trim() }
-              if (lines) return lines
-              else return ['(Empty — rerun login)']
-            } else {
-              return ['(folders.txt not found — run MotioCI Login)']
-            }
-          """
-        ]
-      ]
-    ],
+              echo "Logging in to MotioCI..."
+              python3 ci-cli.py --server="$MOTIO_SERVER" \
+                login --credentialsFile "$CREDENTIALS_FILE" > login.out 2>&1 || true
 
-    //Manual Project & Path overrides
-    [
-      $class: 'DynamicReferenceParameter',
-      name: 'PROJECT_NAME_MANUAL',
-      description: 'Enter Project manually if not listed',
-      defaultValue: ''
-    ],
-    [
-      $class: 'DynamicReferenceParameter',
-      name: 'OBJECT_PATH_MANUAL',
-      description: 'Enter Folder Path manually if not listed',
-      defaultValue: ''
-    ],
-    [
-      $class: 'StringParameterDefinition',
-      name: 'ROLLBACK_LABEL',
-      defaultValue: '',
-      description: 'Enter existing label name to redeploy'
-    ]
-  ])
-])
+              awk 'match($0,/(Auth[[:space:]]*[Tt]oken|x-auth_token|xauthtoken)[[:space:]]*[:=][[:space:]]*([A-Za-z0-9._-]+)/,m){print m[2]}' login.out | tail -n1 > login.token || true
+              TOKEN=$(cat login.token 2>/dev/null || true)
+              if [ -z "$TOKEN" ] || [ "${#TOKEN}" -lt 10 ]; then
+                echo "ERROR: Failed to capture valid auth token!"
+                cat login.out
+                exit 1
+              fi
+
+              echo "$TOKEN" > ../token.txt
+              echo "Login successful."
+
+              # --------------------------------------------------------------------
+              # Fetch MotioCI Projects & Folders for Dynamic Parameters
+              # --------------------------------------------------------------------
+              echo "Fetching available projects for ${SOURCE_ENV}..."
+              python3 ci-cli.py --server="$MOTIO_SERVER" \
+                project ls --xauthtoken "$TOKEN" \
+                --instanceName "${SOURCE_ENV}" > ../projects_raw.json
+
+              grep -o "'name': '[^']*'" ../projects_raw.json | cut -d"'" -f4 | sort | uniq > ../../projects.txt || true
+              echo "Saved project list to: $WORKSPACE/projects.txt"
+              head -n 10 ../../projects.txt || echo "(No projects found)"
+
+              if [ -n "${PROJECT_NAME:-}" ]; then
+                echo "Fetching folders for project: ${PROJECT_NAME}"
+                python3 ci-cli.py --server="$MOTIO_SERVER" \
+                  versionedItems ls --xauthtoken "$TOKEN" \
+                  --instanceName "${SOURCE_ENV}" \
+                  --projectName "${PROJECT_NAME}" > ../folders_raw.json || true
+
+                grep "prettyPath" ../folders_raw.json | cut -d"'" -f4 | sort | uniq > ../../folders.txt || true
+                echo "Saved folder list to: $WORKSPACE/folders.txt"
+                head -n 10 ../../folders.txt || echo "(No folders found)"
+              else
+                echo "Skipping folder discovery — PROJECT_NAME not provided yet."
+              fi
+
+              ls -lh ../../projects.txt ../../folders.txt || true
+            '''
+          }
+        }
+      }
+    }
