@@ -1,88 +1,30 @@
-import groovy.json.JsonSlurper
-import com.cloudbees.plugins.credentials.CredentialsProvider
-import com.cloudbees.plugins.credentials.common.StandardFileCredentials
+# --------------------------------------------------------------------
+# Fetch MotioCI Projects & Folders for Dynamic Parameters
+# --------------------------------------------------------------------
+echo "Fetching available projects for ${SOURCE_ENV}..."
+python3 ci-cli.py --server="$MOTIO_SERVER" \
+  project ls --xauthtoken "$TOKEN" \
+  --instanceName "${SOURCE_ENV}" > ../projects_raw.json
 
-// ===== CONFIG =====
-def MOTIO_SERVER = "https://cgrptmcip01.cloud.cammis.ca.gov"
-def SOURCE_ENV = SOURCE_ENV ?: "Cognos-DEV/TEST"
-def WORKSPACE = "/var/lib/jenkins/workspace/MotioCI/api/CLI"
-def CRED_ID = "cognos-credentials"
-// ===================
+# Extract project names and save to workspace
+grep -o "'name': '[^']*'" ../projects_raw.json | cut -d"'" -f4 | sort | uniq > ../../projects.txt || true
+echo "Saved project list to: $WORKSPACE/projects.txt"
+head -n 10 ../../projects.txt || echo "(No projects found)"
 
-def projects = []
-def TOKEN = ""
+# If user already selected a project, fetch its folders
+if [ -n "${PROJECT_NAME:-}" ]; then
+  echo "Fetching folders for project: ${PROJECT_NAME}"
+  python3 ci-cli.py --server="$MOTIO_SERVER" \
+    versionedItems ls --xauthtoken "$TOKEN" \
+    --instanceName "${SOURCE_ENV}" \
+    --projectName "${PROJECT_NAME}" --currentOnly True > ../folders_raw.json || true
 
+  grep "prettyPath" ../folders_raw.json | cut -d"'" -f4 | sort | uniq > ../../folders.txt || true
+  echo "Saved folder list to: $WORKSPACE/folders.txt"
+  head -n 10 ../../folders.txt || echo "(No folders found)"
+else
+  echo "Skipping folder discovery — PROJECT_NAME not provided yet."
+fi
 
-def cred = CredentialsProvider.lookupCredentials(
-    StandardFileCredentials.class,
-    Jenkins.instance,
-    null,
-    null
-).find { it.id == CRED_ID }
-
-if (!cred) {
-    return ["Credential '${CRED_ID}' not found in Jenkins"]
-}
-
-// Create a temporary copy of the JSON credential file
-def tmpCredFile = File.createTempFile("motio-cred-", ".json")
-tmpCredFile.deleteOnExit()
-tmpCredFile.bytes = cred.content
-
-try {
-
-    def loginCmd = [
-        "bash", "-c",
-        """
-        cd ${WORKSPACE} && \
-        python3 ci-cli.py --server=${MOTIO_SERVER} \
-          login --credentialsFile ${tmpCredFile.absolutePath} > login.out 2>&1 && \
-        awk 'match(\$0,/(xauthtoken|Auth[[:space:]]*Token)[[:space:]]*[:=][[:space:]]*([A-Za-z0-9._-]+)/,m){print m[2]}' login.out | tail -n1
-        """
-    ]
-    def loginProc = loginCmd.execute()
-    def loginOut = new StringBuffer()
-    loginProc.consumeProcessOutput(loginOut, new StringBuffer())
-    loginProc.waitFor()
-
-    TOKEN = loginOut.toString().trim()
-    if (!TOKEN || TOKEN.length() < 10) {
-        return ["Failed to obtain MotioCI token — check credentials.json or CLI path"]
-    }
-
-    def listCmd = [
-        "bash", "-c",
-        """
-        cd ${WORKSPACE} && \
-        python3 ci-cli.py --server=${MOTIO_SERVER} \
-          project ls --xauthtoken ${TOKEN} \
-          --instanceName ${SOURCE_ENV}
-        """
-    ]
-    def listProc = listCmd.execute()
-    def listOut = new StringBuffer()
-    listProc.consumeProcessOutput(listOut, new StringBuffer())
-    listProc.waitFor()
-
-    def outputText = listOut.toString().trim()
-    if (!outputText) {
-        return ["No response from MotioCI — check server or permissions"]
-    }
-
-
-    def data = new JsonSlurper().parseText(outputText)
-    def edges = data?.data?.instances?.edges ?: []
-    edges.each { e ->
-        e?.node?.projects?.edges?.each { p ->
-            def name = p?.node?.name
-            if (name) projects << name
-        }
-    }
-
-    return projects.isEmpty() ? ["No projects found for ${SOURCE_ENV}"] : projects.unique().sort()
-
-} catch (Exception e) {
-    return ["Error fetching projects: ${e.message}"]
-} finally {
-    tmpCredFile.delete()
-}
+# Double-check both files exist
+ls -lh ../../projects.txt ../../folders.txt || true
