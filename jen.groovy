@@ -1,45 +1,44 @@
-  parameters {
-    choice(name: 'SOURCE_ENV', choices: ['DEV','SIT','UAT'], description: 'Source Environment')
-    choice(name: 'TARGET_ENV', choices: ['SIT','UAT','PROD'], description: 'Target Environment')
-    string(name: 'PROJECT_NAME', defaultValue: 'Demo', description: 'MotioCI Project Name')
-    string(name: 'OBJECT_PATH', defaultValue: '', description: 'Optional: Folder or Report path (leave blank for full project)')
-  }
+sh """
+              # Clone tar-surge-client-deployment repo
+              git clone https://${NUSER}:${NPASS}@github.com/ca-mmis/tar-surge-client-deployment.git --depth=1
+              cd tar-surge-client-deployment
+              git checkout master
+              git pull
 
+              # Create folder if not present
+              mkdir -p ${WORKSPACE}/deployrepo/tar-surge-client-deployment/tar-surge-client/SurgeAutoupdate
 
-echo """
-        =====================================================
-        MotioCI Cognos Deployment Pipeline
-        Source: ${params.SOURCE_ENV}
-        Target: ${params.TARGET_ENV}
-        Project: ${params.PROJECT_NAME}
-        Object Path: ${params.OBJECT_PATH ?: 'FULL PROJECT'}
-        =====================================================
-        """
+              # Copy artifacts from Jenkins build output
+              cp ${WORKSPACE}/devops/codedeploy/SurgeUpdate_DEV.ZIP tar-surge-client/SurgeAutoupdate
+              cp ${WORKSPACE}/devops/codedeploy/SurgeUpdate/Version.TXT tar-surge-client/SurgeAutoupdate
 
+              # Commit and push changes
+              if [[ -n \$(git status --porcelain) ]]; then
+                git add .
+                git commit -m "Automated commit - Deploying SurgeUpdate artifacts"
+                git push origin master
+              fi
 
-/Team Content/DemoFolder/Jenkins_srini_folder/jenkinssrinitestreport
-stage('Validate Source Content') {
-      steps {
-        container('python') {
-          script {
-            if (params.OBJECT_PATH?.trim()) {
-              sh '''
-                set -e
-                cd MotioCI/api/CLI
-                TOKEN=$(cat ../../token.txt)
-                echo "Checking that object exists in source project..."
-                python3 ci-cli.py object list \
-                  --server="$MOTIO_SERVER" \
-                  --project "$PROJECT_NAME" \
-                  --instanceName "$SOURCE_INSTANCE" \
-                  --xauthtoken "$TOKEN" | grep "${OBJECT_PATH}" || {
-                    echo "Object ${OBJECT_PATH} not found in source project."; exit 1; }
-                echo "Object exists in source; ready to promote."
-              '''
-            } else {
-              echo "OBJECT_PATH not provided — will deploy entire project."
-            }
-          }
-        }
-      }
-    }
+              # Tag this deployment
+              git tag -f -a "${env_tag_name}" -m "Deploying Thickclient - Tag ${env_tag_name}"
+              git push origin "${env_tag_name}" --force
+            """
+sh """
+  # Clone deployments-combined-devops repo
+  git clone https://${NUSER}:${NPASS}@github.com/ca-mmis/deployments-combined-devops.git --depth=1
+  cd deployments-combined-devops
+  git checkout master
+  git pull
+
+  # Prepare folders
+  mkdir -p ${WORKSPACE}/deployrepo/deployments-combined-devops/SurgeAutoupdate/dev/SurgeUpdate
+  rm -rf SurgeAutoupdate/dev/SurgeUpdate/*
+
+  # Copy new build artifacts
+  cp -a ${WORKSPACE}/devops/codedeploy/SurgeUpdate/. SurgeAutoupdate/dev/SurgeUpdate/
+
+  # Commit and push
+  git add .
+  git commit -m "Updated build artifacts for tar-surge-client build ${env_tag_name}" || true
+  git push https://${NUSER}:${NPASS}@github.com/ca-mmis/deployments-combined-devops.git
+"""
