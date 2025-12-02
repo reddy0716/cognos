@@ -1,17 +1,13 @@
-REM === Cleanup: remove EVERYTHING except the ZIP and Version.TXT ===
-echo Cleaning up D:\SurgeUpdate but keeping ZIP + Version.TXT...
+$RecycleTime = "00:15"   # 12:15 AM PST
 
-for %%F in ("%folder%\*") do (
-    REM Skip ZIPs
-    echo %%~nxF | findstr /I "SurgeUpdate_.*.ZIP" >nul
-    if not !errorlevel! == 0 (
-        REM Skip Version.TXT
-        if /I not "%%~nxF"=="Version.TXT" (
-            echo Deleting: %%F
-            del /q "%%F" 2>nul
-            rmdir /s /q "%%F" 2>nul
-        )
-    )
-)
+Write-Host "Configuring IIS recycle schedule for AppPool '$AppPoolName' at $RecycleTime"
 
-echo Cleanup complete.
+# Clear existing schedule
+Set-ItemProperty "IIS:\AppPools\$AppPoolName" -Name recycling.periodicRestart.schedule -Value @()
+
+# Add the new scheduled recycle time
+Add-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
+  -filter "system.applicationHost/applicationPools/add[@name='$AppPoolName']/recycling/periodicRestart/schedule" `
+  -name "." -value @{value=$RecycleTime}
+
+Write-Host "Recycle Scheduled Successfully at $RecycleTime"
