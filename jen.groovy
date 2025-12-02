@@ -1,35 +1,28 @@
-$RecycleTime = "00:15"   # 12:15 AM PST
+Get-ChildItem IIS:\AppPools | ForEach-Object {
+    Write-Host "Removing app pool: $($_.Name)"
+    Remove-WebAppPool -Name $_.Name -ErrorAction SilentlyContinue
+}
 
-Write-Host "Configuring IIS recycle schedule for AppPool '$AppPoolName' at $RecycleTime"
 
-# Clear existing schedule
-Set-ItemProperty "IIS:\AppPools\$AppPoolName" -Name recycling.periodicRestart.schedule -Value @()
-
-# Add the new scheduled recycle time
-Add-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
-  -filter "system.applicationHost/applicationPools/add[@name='$AppPoolName']/recycling/periodicRestart/schedule" `
-  -name "." -value @{value=$RecycleTime}
-
-Write-Host "Recycle Scheduled Successfully at $RecycleTime"
+Clear-WebConfiguration -Filter "system.applicationHost/applicationPools/add[@name='$AppPoolName']/recycling/periodicRestart/schedule"
 
 
 # ================================
 # SET IIS RECYCLE TIME (12:15 AM PST → 08:15 UTC)
 # ================================
 
-$RecycleTime = "08:15"   # Correct UTC time for 12:15 AM PST
+$RecycleTime = "08:15"
 
-Write-Host "Clearing all existing recycle times for AppPool '$AppPoolName'..."
+Write-Host "Clearing existing recycle schedule for '$AppPoolName'..."
 
-# Completely remove ALL old schedule entries (7:16 PM etc.)
-Clear-WebConfigurationSection -pspath 'MACHINE/WEBROOT/APPHOST' `
-  -filter "system.applicationHost/applicationPools/add[@name='$AppPoolName']/recycling/periodicRestart/schedule"
+# Clear all existing schedule entries (works on all IIS versions)
+Clear-WebConfiguration -Filter "system.applicationHost/applicationPools/add[@name='$AppPoolName']/recycling/periodicRestart/schedule"
 
-Write-Host "Adding new recycle time $RecycleTime UTC..."
+Write-Host "Adding new recycle time $RecycleTime..."
 
-# Add only the new scheduled recycle time
+# Add the new specific recycle time
 Add-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
   -filter "system.applicationHost/applicationPools/add[@name='$AppPoolName']/recycling/periodicRestart/schedule" `
   -name "." -value @{value=$RecycleTime}
 
-Write-Host "Recycle schedule successfully set to $RecycleTime UTC (12:15 AM PST)"
+Write-Host "Recycle schedule updated successfully to $RecycleTime UTC (12:15 AM PST)"
