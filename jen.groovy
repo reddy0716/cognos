@@ -159,6 +159,23 @@ pipeline {
                     cd devops/codedeploy
                     zip -r SurgeUpdate_${env_promotion_to_environment.toUpperCase()}.ZIP SurgeUpdate
 
+                    echo "Preparing ${env_promotion_to_environment.toUpperCase()} directory inside deployments-combined-devops..."
+
+                    cd ${WORKSPACE}/deployrepo/deployments-combined-devops
+                    
+                    # Create target env directory
+                    mkdir -p SurgeAutoupdate/${env_promotion_to_environment}/SurgeUpdate
+                    
+                    # Clean old files
+                    rm -rf SurgeAutoupdate/${env_promotion_to_environment}/SurgeUpdate/*
+                    
+                    # Copy newly created ZIP
+                    cp ${WORKSPACE}/deployrepo/tar-surge-client/devops/codedeploy/SurgeUpdate_${env_promotion_to_environment.toUpperCase()}.ZIP \
+                       SurgeAutoupdate/${env_promotion_to_environment}/SurgeUpdate/
+                    
+                    echo "Updated SurgeAutoupdate/${env_promotion_to_environment}/SurgeUpdate/ with new ZIP"
+
+
                     echo "Build/ZIP Promotion package is ready"
                   """
                 }
