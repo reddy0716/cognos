@@ -1,16 +1,13 @@
-REM === Extract EXE version and write to Version.TXT ===
-set "exePath=%folder%\Cammis.Surge.Client.exe"
-set "versionFile=%folder%\Version.TXT"
+def ENV_ALIAS_MAP = [
+  "SBX": "DEV",
+  "HFX": "SIT"
+]
 
-echo Checking EXE version and writing to Version.TXT...
-powershell -Command "(Get-Item '%exePath%').VersionInfo.FileVersion | Out-File '%versionFile%' -Encoding ascii"
+if (params.DEPLOY_ENV == "NONE") {
+  SURGE_ENV = "NONE"
+} else {
+  SURGE_ENV = ENV_ALIAS_MAP[params.DEPLOY_ENV]
+}
 
-if exist "%versionFile%" (
-    echo Version successfully written:
-    type "%versionFile%"
-) else (
-    echo ERROR: Failed to update Version.TXT
-)
-
-echo Deployment complete.
-endlocal
+echo "User selected label : ${params.DEPLOY_ENV}"
+echo "Resolved SURGE_ENV  : ${SURGE_ENV}"
