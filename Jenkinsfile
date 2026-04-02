@@ -1,213 +1,195 @@
-/*
-=======================================================================================
- ENV PIPELINE
+function Stop-Web-App-Pool($AppPoolName) {
+     if ((Get-WebAppPoolState -Name $AppPoolName).Value -eq "Stopped") {
+         Write-Host "$AppPoolName already stopped"
+     }
+     else {
+         Write-Host "Shutting down $AppPoolName"
+         Stop-WebAppPool -Name $AppPoolName
+     }
+ 
+     do {
+         Start-Sleep -Seconds 1
+     } until ((Get-WebAppPoolState -Name $AppPoolName).Value -eq "Stopped")
+ }
+ 
+ function Stop-Web-Site($WebsiteName) {
+     if ((Get-WebsiteState -Name $WebsiteName).Value -eq "Stopped") {
+         Write-Host "$WebsiteName already stopped"
+     }
+     else {
+         Write-Host "Shutting down $WebsiteName"
+         Stop-Website -Name $WebsiteName
+     }
+ 
+     do {
+         Start-Sleep -Seconds 1
+     } until ((Get-WebsiteState -Name $WebsiteName).Value -eq "Stopped")
+ }
+ 
+ # Ensure script runs in 64-bit mode
+ if ($PSHOME -like "*SysWOW64*") {
+     Write-Warning "Restarting script in 64-bit Windows PowerShell..."
+     & (Join-Path ($PSHOME -replace "SysWOW64", "SysNative") powershell.exe) -NoProfile -File `
+         (Join-Path $PSScriptRoot $MyInvocation.MyCommand) @args
+     Exit $LastExitCode
+ }
+ 
+ # Setup Paths & Variables
+ Import-Module -Name WebAdministration
+ $SiteName = "Apiservices-SBX"
+ $SiteFolder = 'E:\inetpub\ApiServices'
+ $LoggingDir = 'E:\IISLogs'
+ $AppPoolName = 'Apiservices-SBX'
+ $StagingDir = "E:\tar-surge-Api-staging"
+ $IISRootDir = "E:\inetpub"
+ $BindingProtocol = "http"
+ $BindingPort     = 8081
+ 
 
- User-facing labels:
-   SBX -> DEV server
-   HFX -> SIT server
+ 
+ # Ensure Required Directories Exist
+ Write-Host "Ensuring required directories exist..."
+ @("$SiteFolder", "$LoggingDir", "E:\apps\ErrorLogs") | ForEach-Object {
+     if (-Not (Test-Path -Path $_)) {
+         New-Item -ItemType "directory" -Path $_ | Out-Null
+     }
+ }
 
- TARGET_ENV  : Used for CodeDeploy / Vault / RPM resolution
- DISPLAY_ENV : Logical label (SANDBOX / HOTFIX)
-=======================================================================================
-*/
+# Stop Site & App Pool if they exist
+ Write-Host "Stopping '$SiteName'"
+ Stop-Web-Site("$SiteName")
+ Write-Host "Stopping Application Pool '$AppPoolName'"
+ Stop-Web-App-Pool("$AppPoolName")
 
-def branch = env.BRANCH_NAME ?: "master"
-def workingDir = "/home/jenkins/agent"
+# Remove Existing Site & App Pool
+Write-Host "Removing '$SiteName' from IIS"
+Remove-Website -Name "$SiteName" -ErrorAction SilentlyContinue
 
-// Resolved variables
-def TARGET_ENV  = ""
-def DISPLAY_ENV = ""
+Write-Host "Removing Application Pool '$AppPoolName'"
+Remove-WebAppPool -Name "$AppPoolName" -ErrorAction SilentlyContinue
 
-def VAULT_SECRET_PATH = [
-  "DEV":"kv-dev/data/us-west/dev-tar/tar-surgenet-service-secrets",
-  "SIT":"kv-tst/data/us-west/sit-tar/tar-surgenet-service-secrets"
-]
+# Create New Application Pool
+Write-Host "Creating Application Pool '$AppPoolName'"
+New-WebAppPool -Name $AppPoolName
 
-def VAULT_SECRET_PATH_LTAR = [
-  "DEV":"kv-dev/data/us-west/dev-tar/tar-ltar-service-secrets",
-  "SIT":"kv-tst/data/us-west/sit-tar/tar-ltar-service-secrets"
-]
+# Create IIS Site (No Nested App)
+Write-Host "Creating IIS site '$SiteName' and assigning to App Pool '$AppPoolName'"
+New-WebSite -Name "$SiteName" -PhysicalPath "$SiteFolder" -ApplicationPool "$AppPoolName" -Force
 
-def VAULT_SECRET_PATH_IMGVWR = [
-  "DEV":"kv-dev/data/us-west/dev-tar/tar-image-viewer-service-secrets",
-  "SIT":"kv-tst/data/us-west/sit-tar/tar-image-viewer-service-secrets"
-]
+Get-WebBinding -Name "$SiteName" -ErrorAction SilentlyContinue | Remove-WebBinding -ErrorAction SilentlyContinue
+New-WebBinding -Name "$SiteName" -Protocol $BindingProtocol -Port $BindingPort
+ 
+# Configure Logging Directory
+Write-Host "Setting logging directory only for site '$SiteName'"
+Set-ItemProperty "IIS:\Sites\$SiteName" -Name logFile.directory -Value $LoggingDir
+ 
+Write-Host "Setting $AppPoolName to No Managed Code"
+Set-ItemProperty "IIS:\AppPools\$AppPoolName" -Name managedRuntimeVersion -Value ""
 
-def SURGE_ENV_CONFIG = [
-  "DEV": ["SURGE_ENVNAME":"DEV", "SURGE_RPM_ROOT":"D:/inetpub/ApiServices/RPM/dhcs_dev/rpm_root"],
-  "SIT": ["SURGE_ENVNAME":"SIT", "SURGE_RPM_ROOT":"D:/inetpub/ApiServices/RPM/dhcs_sit/rpm_root"]
-]
+# ================================
+# SET IIS RECYCLE TIME (12:45 AM PST → 08:45 UTC)
+# ================================
 
-def VAULT_ADDR = [
-  "DEV":"https://np.secrets.cammis.medi-cal.ca.gov/v1/",
-  "SIT":"https://np.secrets.cammis.medi-cal.ca.gov/v1/"
-]
+$RecycleTime = "08:45"
 
-def VAULT_APPROLE_AUTH_PATH = "auth/approle/login"
+Write-Host "Clearing existing recycle schedule for '$AppPoolName'..."
 
-pipeline {
-  agent {
-    kubernetes {
-      yaml """
-apiVersion: v1
-kind: Pod
-spec:
-  serviceAccountName: jenkins
-  containers:
-    - name: aws-boto3
-      image: 136299550619.dkr.ecr.us-west-2.amazonaws.com/cammisboto3:1.0.1
-      tty: true
-      command: ["/bin/bash"]
-      workingDir: ${workingDir}
-"""
-    }
-  }
+# Clear all existing schedule entries (works on all IIS versions)
+Clear-WebConfiguration -Filter "system.applicationHost/applicationPools/add[@name='$AppPoolName']/recycling/periodicRestart/schedule"
 
-  options {
-    timestamps()
-    disableConcurrentBuilds()
-    timeout(time:5 , unit: 'HOURS')
-    skipDefaultCheckout()
-    buildDiscarder(logRotator(numToKeepStr: '20'))
-  }
+Write-Host "Adding new recycle time $RecycleTime..."
 
-  environment {
-    env_DEPLOY_ENVIRONMENT = "true"
-    env_DEPLOY_FILES       = "false"
-    env_DEPLOY_CONFIG      = "false"
-  }
+# Add the new specific recycle time
+Add-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
+  -filter "system.applicationHost/applicationPools/add[@name='$AppPoolName']/recycling/periodicRestart/schedule" `
+  -name "." -value @{value=$RecycleTime}
 
-  stages {
+Write-Host "Recycle schedule updated successfully to $RecycleTime UTC (12:15 AM PST)"
 
-    /* =========================
-       INITIALIZE
-       ========================= */
-    stage("Initialize") {
-      steps {
-        container("aws-boto3") {
-          script {
+# === Grant App Pool permission to zConnect cert using Subject ===
 
-            properties([
-              parameters([
-                choice(
-                  name: 'DEPLOY_ENV',
-                  choices: ['NONE','SBX','HFX'],
-                  description: 'Deployment Environment'
-                )
-              ])
-            ])
+$appPoolIdentity = "IIS AppPool\Apiservices-SBX"
 
-            def ENV_ALIAS_MAP = [
-              "SBX": [TARGET:"DEV", DISPLAY:"SANDBOX"],
-              "HFX": [TARGET:"SIT", DISPLAY:"HOTFIX"]
-            ]
-
-            if (params.DEPLOY_ENV == "NONE") {
-              TARGET_ENV  = "NONE"
-              DISPLAY_ENV = "NONE"
-            } else {
-              TARGET_ENV  = ENV_ALIAS_MAP[params.DEPLOY_ENV].TARGET
-              DISPLAY_ENV = ENV_ALIAS_MAP[params.DEPLOY_ENV].DISPLAY
-            }
-
-            echo "User selected label   : ${params.DEPLOY_ENV}"
-            echo "Resolved TARGET_ENV   : ${TARGET_ENV}"
-            echo "Resolved DISPLAY_ENV  : ${DISPLAY_ENV}"
-
-            deleteDir()
-            checkout(scm)
-          }
-        }
-      }
-    }
-
-    /* =========================
-       PREPARE DEPLOYMENT
-       ========================= */
-    stage("Prepare Deployment") {
-      when {
-        expression { TARGET_ENV != "NONE" }
-      }
-      steps {
-        container("aws-boto3") {
-          script {
-
-            def surgeEnv = SURGE_ENV_CONFIG[TARGET_ENV]
-
-            sh """
-              echo "Preparing CodeDeploy structure"
-              mkdir -p devops/codedeploy/surgeapi
-              touch devops/codedeploy/surgeapi/placeholder.txt
-
-              echo "Injecting Vault configuration"
-              sed -i "s,{VAULT_ADDR},${VAULT_ADDR[TARGET_ENV]}," devops/codedeploy/environment/deploy-environment.ps1
-              sed -i "s,{VAULT_SECRET_PATH},${VAULT_SECRET_PATH[TARGET_ENV]}," devops/codedeploy/environment/deploy-environment.ps1
-              sed -i "s,{VAULT_SECRET_PATH_LTAR},${VAULT_SECRET_PATH_LTAR[TARGET_ENV]}," devops/codedeploy/environment/deploy-environment.ps1
-              sed -i "s,{VAULT_SECRET_PATH_IMGVWR},${VAULT_SECRET_PATH_IMGVWR[TARGET_ENV]}," devops/codedeploy/environment/deploy-environment.ps1
-              sed -i "s,{VAULT_APPROLE_AUTH_PATH},${VAULT_APPROLE_AUTH_PATH}," devops/codedeploy/environment/deploy-environment.ps1
-
-              echo "Injecting SURGE values"
-              sed -i "s,{SURGE_ENVNAME},${surgeEnv.SURGE_ENVNAME}," devops/codedeploy/environment/deploy-environment.ps1
-              sed -i "s,{SURGE_RPM_ROOT},${surgeEnv.SURGE_RPM_ROOT}," devops/codedeploy/environment/deploy-environment.ps1
-
-              echo "Enable ENV deployment mode"
-              sed -i "s,{DEPLOY_ENVIRONMENT},${env_DEPLOY_ENVIRONMENT}," devops/codedeploy/after-install.bat
-            """
-
-            withCredentials([
-              string(credentialsId: 'APPROLE_ROLE_ID',   variable: 'APPROLE_ROLE_ID'),
-              string(credentialsId: 'APPROLE_SECRET_ID', variable: 'APPROLE_SECRET_ID')
-            ]) {
-              sh """
-                sed -i "s,{APPROLE_ROLE_ID},${APPROLE_ROLE_ID}," devops/codedeploy/environment/deploy-environment.ps1
-                sed -i "s,{APPROLE_SECRET_ID},${APPROLE_SECRET_ID}," devops/codedeploy/environment/deploy-environment.ps1
-              """
-            }
-          }
-        }
-      }
-    }
-
-    /* =========================
-       DEPLOY
-       ========================= */
-    stage("Deploy") {
-      when {
-        expression { TARGET_ENV != "NONE" }
-      }
-      steps {
-        container("aws-boto3") {
-          script {
-
-            echo "Deploying ENV config to ${TARGET_ENV}"
-
-            withCredentials([aws(
-              accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-              secretKeyVariable: 'AWS_SECRET_ACCESS_KEY',
-              credentialsId: 'jenkins-ecr'
-            )]) {
-
-              step([$class: 'AWSCodeDeployPublisher',
-                applicationName: "tar-surge-app-${TARGET_ENV}",
-                deploymentGroupName: "tar-surge-app-${TARGET_ENV}-INPLACE-deployment-group",
-                deploymentConfig: "tar-surge-app-${TARGET_ENV}-config",
-                region: 'us-west-2',
-                s3bucket: 'dhcs-codedeploy-app',
-                deploymentMethod: 'deploy',
-                includes: '**',
-                subdirectory: 'devops/codedeploy',
-                waitForCompletion: true
-              ])
-            }
-          }
-        }
-      }
-    }
-  }
-
-  post {
-    always  { echo "ENV deployment pipeline complete." }
-    success { echo "ENV deployment successful." }
-    failure { echo "ENV deployment failed." }
-  }
+# Search for certificate by subject (Common Name)
+$cert = Get-ChildItem -Path Cert:\LocalMachine\My | Where-Object {
+    $_.Subject -like '*zOSConnect*Client*'
 }
+
+if (-not $cert) {
+    Write-Error "zConnect certificate with CN 'MMIS Surge zOSConnect Client' not found."
+    exit 1
+}
+
+Write-Host "Found zConnect certificate: $($cert.Subject)"
+
+# Locate the private key file path
+$keyFile = Join-Path "$env:ProgramData\Microsoft\Crypto\RSA\MachineKeys" `
+    $cert.PrivateKey.CspKeyContainerInfo.UniqueKeyContainerName
+
+# Grant Read permission if not already present
+$acl = Get-Acl $keyFile
+if (-not ($acl.Access | Where-Object { $_.IdentityReference -eq $appPoolIdentity })) {
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($appPoolIdentity, "Read", "Allow")
+    $acl.AddAccessRule($rule)
+    Set-Acl $keyFile $acl
+    Write-Host "Read access granted to $appPoolIdentity on zConnect cert"
+} else {
+    Write-Host "$appPoolIdentity already has read access to zConnect cert"
+}
+
+
+# Disable time-based recycling (default is 1740 minutes)
+Write-Host "Disabling regular time interval recycling for $AppPoolName"
+Set-WebConfigurationProperty -Filter "/system.applicationHost/applicationPools/add[@name='$AppPoolName']/recycling/periodicRestart" -Name "time" -Value "00:00:00"
+
+# Enable 'Load User Profile'
+Write-Host "Setting 'Load User Profile' to True for $AppPoolName"
+Set-ItemProperty "IIS:\AppPools\$AppPoolName" -Name processModel.loadUserProfile -Value $true
+
+# increase IIS size to 120MB
+#Set-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
+#-filter "system.webServer/security/requestFiltering/requestLimits" `
+#-name "maxAllowedContentLength" -value 125829120
+
+# increase iis buffering
+#Set-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
+#-filter "system.webServer/serverRuntime" `
+#-name "uploadReadAheadSize" -value 131072
+
+Write-Host "Pushing the index.html file out"
+if (Test-Path "$IISRootDir\index.html") {
+    Remove-Item "$IISRootDir\index.html"
+}
+Copy-Item $StagingDir\serverconfig\index.html -Destination $IISRootDir
+$HOST_NAME = & hostname
+(Get-Content $IISRootDir\index.html) -replace "{server-hostname}", "$HOST_NAME" | Set-Content $IISRootDir\index.html
+
+Write-Host "Installing/Updating Datadog Configuration"
+
+$DatadogTarget = "C:\ProgramData\Datadog\conf.d\surge_sbx.d"
+
+Write-Host "Installing/Updating SBX-specific Datadog configuration"
+if (-Not (Test-Path $DatadogTarget)) {
+    New-Item -ItemType Directory -Path $DatadogTarget | Out-Null
+}
+
+xcopy /s /y /e "$StagingDir\serverconfig\datadog\conf.d\surge_sbx.d\*" "$DatadogTarget\"
+
+Write-Host "`nAdding ddagentuser to C:\ProgramData\Amazon\CodeDeploy\deployment-logs so Datadog can read the CodeDeploy log file`n"
+$Folder = 'C:\ProgramData\Amazon\CodeDeploy\deployment-logs'
+$ACL = Get-Acl $Folder
+$ACL_Rule = new-object System.Security.AccessControl.FileSystemAccessRule (
+    'ddagentuser',
+    'ReadAndExecute',
+    ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::Objectinherit),
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow
+)
+$ACL.SetAccessRule($ACL_Rule)
+Set-Acl -Path $Folder -AclObject $ACL
+
+Write-Host "Restarting the Datadog agent service"
+& 'C:\Program Files\Datadog\Datadog Agent\bin\agent.exe' restart-service
+
+
+Write-Host "Configuration Deploy Complete"
