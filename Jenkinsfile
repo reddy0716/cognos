@@ -1,195 +1,125 @@
 function Stop-Web-App-Pool($AppPoolName) {
-     if ((Get-WebAppPoolState -Name $AppPoolName).Value -eq "Stopped") {
-         Write-Host "$AppPoolName already stopped"
-     }
-     else {
-         Write-Host "Shutting down $AppPoolName"
-         Stop-WebAppPool -Name $AppPoolName
-     }
- 
-     do {
-         Start-Sleep -Seconds 1
-     } until ((Get-WebAppPoolState -Name $AppPoolName).Value -eq "Stopped")
- }
- 
- function Stop-Web-Site($WebsiteName) {
-     if ((Get-WebsiteState -Name $WebsiteName).Value -eq "Stopped") {
-         Write-Host "$WebsiteName already stopped"
-     }
-     else {
-         Write-Host "Shutting down $WebsiteName"
-         Stop-Website -Name $WebsiteName
-     }
- 
-     do {
-         Start-Sleep -Seconds 1
-     } until ((Get-WebsiteState -Name $WebsiteName).Value -eq "Stopped")
- }
- 
- # Ensure script runs in 64-bit mode
- if ($PSHOME -like "*SysWOW64*") {
-     Write-Warning "Restarting script in 64-bit Windows PowerShell..."
-     & (Join-Path ($PSHOME -replace "SysWOW64", "SysNative") powershell.exe) -NoProfile -File `
-         (Join-Path $PSScriptRoot $MyInvocation.MyCommand) @args
-     Exit $LastExitCode
- }
- 
- # Setup Paths & Variables
- Import-Module -Name WebAdministration
- $SiteName = "Apiservices-SBX"
- $SiteFolder = 'E:\inetpub\ApiServices'
- $LoggingDir = 'E:\IISLogs'
- $AppPoolName = 'Apiservices-SBX'
- $StagingDir = "E:\tar-surge-Api-staging"
- $IISRootDir = "E:\inetpub"
- $BindingProtocol = "http"
- $BindingPort     = 8081
- 
+  if ( (Get-WebAppPoolState -Name $AppPoolName).Value -eq "Stopped" ) {
+      Write-Host $AppPoolName " already stopped"
+  }
+  else {
+      Write-Host "Shutting down the " $AppPoolName
+      Write-Host "    $AppPoolName status: " (Get-WebAppPoolState $AppPoolName).Value
+      Stop-WebAppPool -Name $AppPoolName 
+  }
 
- 
- # Ensure Required Directories Exist
- Write-Host "Ensuring required directories exist..."
- @("$SiteFolder", "$LoggingDir", "E:\apps\ErrorLogs") | ForEach-Object {
-     if (-Not (Test-Path -Path $_)) {
-         New-Item -ItemType "directory" -Path $_ | Out-Null
-     }
- }
+  do {
+      Write-Host "    $AppPoolName status: " (Get-WebAppPoolState $AppPoolName).Value
+      Start-Sleep -Seconds 1
+  }
+  until ( (Get-WebAppPoolState -Name $AppPoolName).Value -eq "Stopped" )
+}
 
-# Stop Site & App Pool if they exist
- Write-Host "Stopping '$SiteName'"
- Stop-Web-Site("$SiteName")
- Write-Host "Stopping Application Pool '$AppPoolName'"
- Stop-Web-App-Pool("$AppPoolName")
+function Stop-Web-Site($WebsiteName) {
+  if ( (Get-WebsiteState -Name $WebsiteName).Value -eq "Stopped" ) {
+      Write-Host $WebsiteName " already stopped"
+  }
+  else {
+      Write-Host "Shutting down the " $WebsiteName
+      Write-Host "    $WebsiteName status: " (Get-WebsiteState $WebsiteName).Value
+      Stop-Website -Name $WebsiteName 
+  }
 
-# Remove Existing Site & App Pool
-Write-Host "Removing '$SiteName' from IIS"
-Remove-Website -Name "$SiteName" -ErrorAction SilentlyContinue
+  do {
+      Write-Host "    $WebsiteName status: " (Get-WebsiteState $WebsiteName).Value
+      Start-Sleep -Seconds 1
+  }
+  until ( (Get-WebsiteState -Name $WebsiteName).Value -eq "Stopped" )
+}
 
-Write-Host "Removing Application Pool '$AppPoolName'"
-Remove-WebAppPool -Name "$AppPoolName" -ErrorAction SilentlyContinue
+# This is needed because AWS CodeDeploy Agent runs in 32-bit mode,
+# script below needs to run in 64-bit mode.
 
-# Create New Application Pool
-Write-Host "Creating Application Pool '$AppPoolName'"
-New-WebAppPool -Name $AppPoolName
+# Are you running in 32-bit mode?
+#   (\SysWOW64\ = 32-bit mode)
 
-# Create IIS Site (No Nested App)
-Write-Host "Creating IIS site '$SiteName' and assigning to App Pool '$AppPoolName'"
-New-WebSite -Name "$SiteName" -PhysicalPath "$SiteFolder" -ApplicationPool "$AppPoolName" -Force
+if ($PSHOME -like "*SysWOW64*")
+{
+  Write-Warning "Restarting this script under 64-bit Windows PowerShell."
 
-Get-WebBinding -Name "$SiteName" -ErrorAction SilentlyContinue | Remove-WebBinding -ErrorAction SilentlyContinue
-New-WebBinding -Name "$SiteName" -Protocol $BindingProtocol -Port $BindingPort
- 
-# Configure Logging Directory
-Write-Host "Setting logging directory only for site '$SiteName'"
-Set-ItemProperty "IIS:\Sites\$SiteName" -Name logFile.directory -Value $LoggingDir
- 
-Write-Host "Setting $AppPoolName to No Managed Code"
-Set-ItemProperty "IIS:\AppPools\$AppPoolName" -Name managedRuntimeVersion -Value ""
+  # Restart this script under 64-bit Windows PowerShell.
+  #   (\SysNative\ redirects to \System32\ for 64-bit mode)
+
+  & (Join-Path ($PSHOME -replace "SysWOW64", "SysNative") powershell.exe) -File `
+    (Join-Path $PSScriptRoot $MyInvocation.MyCommand) @args
+
+  # Exit 32-bit script.
+
+  Exit $LastExitCode
+}
+
+# Was restart successful?
+Write-Warning "Hello from $PSHOME"
+Write-Warning "  (\SysWOW64\ = 32-bit mode, \System32\ = 64-bit mode)"
+Write-Warning "Original arguments (if any): $args"
+
+Import-Module WebAdministration
+
+# Variables
+$SiteName = "Apiservices-SBX"
+$AppPoolName = "Apiservices-SBX"
+
+# Stop Site and App Pools
+Write-Host "Stopping $SiteName"
+Stop-Web-Site("$SiteName")
+Write-Host "Stop status: $?"
+
+Write-Host "Sleeping for 5 seconds for web site to stop"
+Start-Sleep -Seconds 5
+
+Write-Host "Stopping Application Pools"
+Stop-Web-App-Pool("Apiservices-SBX")
+
+
+Write-Host "Sleeping for 5 seconds for app pools to stop"
+Start-Sleep -Seconds 5
+
+Write-Host "Status of Application Pools"
+Get-IISAppPool -Name Apiservices-SBX
 
 # ================================
-# SET IIS RECYCLE TIME (12:45 AM PST → 08:45 UTC)
+# SET APP POOL LEVEL ENV VARIABLES
 # ================================
 
-$RecycleTime = "08:45"
+Write-Host "Setting App Pool–level environment variables for $AppPoolName"
 
-Write-Host "Clearing existing recycle schedule for '$AppPoolName'..."
+$envVars = @{
+    VAULT_ADDRESS              = "{VAULT_ADDR}"
+    VAULT_APPROLE_ROLE_ID      = "{APPROLE_ROLE_ID}"
+    VAULT_APPROLE_SECRET_ID    = "{APPROLE_SECRET_ID}"
+    VAULT_SECRET_PATH          = "{VAULT_SECRET_PATH}"
+    VAULT_SECRET_PATH_LTAR     = "{VAULT_SECRET_PATH_LTAR}"
+    VAULT_SECRET_PATH_IMGVWR   = "{VAULT_SECRET_PATH_IMGVWR}"
+    VAULT_APPROLE_AUTH_PATH    = "{VAULT_APPROLE_AUTH_PATH}"
 
-# Clear all existing schedule entries (works on all IIS versions)
-Clear-WebConfiguration -Filter "system.applicationHost/applicationPools/add[@name='$AppPoolName']/recycling/periodicRestart/schedule"
+    SURGE_ENVNAME              = "{SURGE_ENVNAME}"
+    SURGE_RPM_ROOT             = "{SURGE_RPM_ROOT}"
+    SURGE_RPM_ONLINE_KEY       = "/online"
 
-Write-Host "Adding new recycle time $RecycleTime..."
-
-# Add the new specific recycle time
-Add-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
-  -filter "system.applicationHost/applicationPools/add[@name='$AppPoolName']/recycling/periodicRestart/schedule" `
-  -name "." -value @{value=$RecycleTime}
-
-Write-Host "Recycle schedule updated successfully to $RecycleTime UTC (12:15 AM PST)"
-
-# === Grant App Pool permission to zConnect cert using Subject ===
-
-$appPoolIdentity = "IIS AppPool\Apiservices-SBX"
-
-# Search for certificate by subject (Common Name)
-$cert = Get-ChildItem -Path Cert:\LocalMachine\My | Where-Object {
-    $_.Subject -like '*zOSConnect*Client*'
+    DD_LOGS_ENABLED            = "true"
 }
 
-if (-not $cert) {
-    Write-Error "zConnect certificate with CN 'MMIS Surge zOSConnect Client' not found."
-    exit 1
-}
+Set-ItemProperty "IIS:\AppPools\$AppPoolName" `
+  -Name processModel.environmentVariables `
+  -Value $envVars
 
-Write-Host "Found zConnect certificate: $($cert.Subject)"
+Write-Host "App Pool environment variables applied successfully"
 
-# Locate the private key file path
-$keyFile = Join-Path "$env:ProgramData\Microsoft\Crypto\RSA\MachineKeys" `
-    $cert.PrivateKey.CspKeyContainerInfo.UniqueKeyContainerName
-
-# Grant Read permission if not already present
-$acl = Get-Acl $keyFile
-if (-not ($acl.Access | Where-Object { $_.IdentityReference -eq $appPoolIdentity })) {
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($appPoolIdentity, "Read", "Allow")
-    $acl.AddAccessRule($rule)
-    Set-Acl $keyFile $acl
-    Write-Host "Read access granted to $appPoolIdentity on zConnect cert"
-} else {
-    Write-Host "$appPoolIdentity already has read access to zConnect cert"
-}
+# Start Site and App Pools
+Write-Host "Starting Application Pools"
+Start-WebAppPool -Name "Apiservices-SBX"
 
 
-# Disable time-based recycling (default is 1740 minutes)
-Write-Host "Disabling regular time interval recycling for $AppPoolName"
-Set-WebConfigurationProperty -Filter "/system.applicationHost/applicationPools/add[@name='$AppPoolName']/recycling/periodicRestart" -Name "time" -Value "00:00:00"
+Write-Host "Status of Application Pools"
+Get-IISAppPool -Name Apiservices-SBX
 
-# Enable 'Load User Profile'
-Write-Host "Setting 'Load User Profile' to True for $AppPoolName"
-Set-ItemProperty "IIS:\AppPools\$AppPoolName" -Name processModel.loadUserProfile -Value $true
+Write-Host "Starting $SiteName"
+Start-Website -name "$SiteName"
+Write-Host "Start status: $?"
 
-# increase IIS size to 120MB
-#Set-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
-#-filter "system.webServer/security/requestFiltering/requestLimits" `
-#-name "maxAllowedContentLength" -value 125829120
-
-# increase iis buffering
-#Set-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
-#-filter "system.webServer/serverRuntime" `
-#-name "uploadReadAheadSize" -value 131072
-
-Write-Host "Pushing the index.html file out"
-if (Test-Path "$IISRootDir\index.html") {
-    Remove-Item "$IISRootDir\index.html"
-}
-Copy-Item $StagingDir\serverconfig\index.html -Destination $IISRootDir
-$HOST_NAME = & hostname
-(Get-Content $IISRootDir\index.html) -replace "{server-hostname}", "$HOST_NAME" | Set-Content $IISRootDir\index.html
-
-Write-Host "Installing/Updating Datadog Configuration"
-
-$DatadogTarget = "C:\ProgramData\Datadog\conf.d\surge_sbx.d"
-
-Write-Host "Installing/Updating SBX-specific Datadog configuration"
-if (-Not (Test-Path $DatadogTarget)) {
-    New-Item -ItemType Directory -Path $DatadogTarget | Out-Null
-}
-
-xcopy /s /y /e "$StagingDir\serverconfig\datadog\conf.d\surge_sbx.d\*" "$DatadogTarget\"
-
-Write-Host "`nAdding ddagentuser to C:\ProgramData\Amazon\CodeDeploy\deployment-logs so Datadog can read the CodeDeploy log file`n"
-$Folder = 'C:\ProgramData\Amazon\CodeDeploy\deployment-logs'
-$ACL = Get-Acl $Folder
-$ACL_Rule = new-object System.Security.AccessControl.FileSystemAccessRule (
-    'ddagentuser',
-    'ReadAndExecute',
-    ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::Objectinherit),
-    [System.Security.AccessControl.PropagationFlags]::None,
-    [System.Security.AccessControl.AccessControlType]::Allow
-)
-$ACL.SetAccessRule($ACL_Rule)
-Set-Acl -Path $Folder -AclObject $ACL
-
-Write-Host "Restarting the Datadog agent service"
-& 'C:\Program Files\Datadog\Datadog Agent\bin\agent.exe' restart-service
-
-
-Write-Host "Configuration Deploy Complete"
+Write-Host "Environment Deploy Complete"
