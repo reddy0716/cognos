@@ -203,6 +203,8 @@ pipeline {
                           mkdir -p tar-surge-app/${env_promotion_to_environment}
 
                           # Restore target folder from specific ref
+                          git ls-tree -r ${rollbackRef} --name-only | grep "tar-surge-app/${env_promotion_to_environment}" || (echo "Invalid rollback ref or path not found" && exit 1)
+
                           git checkout ${rollbackRef} -- tar-surge-app/${env_promotion_to_environment}
 
                           git add -Av
@@ -263,6 +265,15 @@ pipeline {
       }
     }
     
+stage('Approval for PRD') {
+  when {
+    expression { env_promotion_to_environment == "prd" }
+  }
+  steps {
+    input message: "Approve deployment to PRD?", ok: "Proceed"
+  }
+}  
+    
   stage('Deploy') {
       steps {
         container(name: "aws-boto3") {
@@ -275,7 +286,7 @@ pipeline {
               cp -a ${WORKSPACE}/deployrepo/deployments-combined-devops/tar-surge-app/${env_promotion_to_environment}/. ${WORKSPACE}/devops/codedeploy/
               sed -i "s,{DEPLOY_FILES},true," ${WORKSPACE}/devops/codedeploy/after-install.bat
             """
-            SURGE_ENV = ENV_ALIAS_MAP[env_promotion_to_environment]
+            
 
             echo "Here is the environment to go to: ${SURGE_ENV}"
 
