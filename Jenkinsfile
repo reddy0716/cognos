@@ -1,14 +1,39 @@
-Write-Host "Setting logging directory for '$SiteName' (site-specific)"
-Set-ItemProperty "IIS:\Sites\$SiteName" -Name logFile.directory -Value $LoggingDir
+# ================================
+# SET APP POOL LEVEL ENV VARIABLES
+# ================================
 
-Write-Host "Installing/Updating SBX-specific Datadog Configuration"
+Import-Module WebAdministration
 
-$DatadogTarget = "C:\ProgramData\Datadog\conf.d\etar_sbx.d"
+$SiteName    = "ETarWeb-SBX"
+$AppPoolName = "ETarWeb-SBX"
 
-if (-Not (Test-Path $DatadogTarget)) {
-    New-Item -ItemType Directory -Path $DatadogTarget | Out-Null
+Write-Host "Setting App Pool–level environment variables for $AppPoolName"
+
+# Format RPM root
+$rawRpmRoot = "{SURGE_RPM_ROOT}"
+$formattedRpmRoot = $rawRpmRoot -replace '/', [char]92
+
+# Define env vars
+$envVars = @{
+    VAULT_ADDRESS              = "{VAULT_ADDR}"
+    VAULT_APPROLE_ROLE_ID      = "{APPROLE_ROLE_ID}"
+    VAULT_APPROLE_SECRET_ID    = "{APPROLE_SECRET_ID}"
+    VAULT_SECRET_PATH          = "{VAULT_SECRET_PATH}"
+    VAULT_SECRET_PATH_LTAR     = "{VAULT_SECRET_PATH_LTAR}"
+    VAULT_SECRET_PATH_IMGVWR   = "{VAULT_SECRET_PATH_IMGVWR}"
+    VAULT_APPROLE_AUTH_PATH    = "{VAULT_APPROLE_AUTH_PATH}"
+
+    APIPath                    = "{SURGE_API_PATH}"
+    SURGE_ENVNAME              = "{SURGE_ENVNAME}"
+    SURGE_RPM_ONLINE_KEY       = "/online"
+    SURGE_RPM_ROOT             = $formattedRpmRoot
+
+    DD_LOGS_ENABLED            = "true"
 }
 
-xcopy /s /y /e "$StagingDir\serverconfig\datadog\conf.d\etar_sbx.d\*" "$DatadogTarget\"
+# Apply ONLY to AppPool (SAFE)
+Set-ItemProperty "IIS:\AppPools\$AppPoolName" `
+  -Name processModel.environmentVariables `
+  -Value $envVars
 
-Remove-Item "$IISRootDir\index.html" -ErrorAction SilentlyContinue
+Write-Host "App Pool environment variables applied successfully"
