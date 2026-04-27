@@ -1,14 +1,12 @@
-Write-Host "Setting logging directory for '$SiteName' (site-specific)"
-Set-ItemProperty "IIS:\Sites\$SiteName" -Name logFile.directory -Value $LoggingDir
+echo "Replacing tokenized values for accessing Vault"
 
-Write-Host "Installing/Updating SBX-specific Datadog Configuration"
+sed -i "s|{VAULT_ADDR}|${VAULT_ADDR["${SURGE_ENV}"]}|g" devops/codedeploy/environment/deploy-environment.ps1
+sed -i "s|{VAULT_SECRET_PATH}|${VAULT_SECRET_PATH["${SURGE_ENV}"]}|g" devops/codedeploy/environment/deploy-environment.ps1
+sed -i "s|{VAULT_SECRET_PATH_LTAR}|${VAULT_SECRET_PATH_LTAR["${SURGE_ENV}"]}|g" devops/codedeploy/environment/deploy-environment.ps1
+sed -i "s|{VAULT_SECRET_PATH_IMGVWR}|${VAULT_SECRET_PATH_IMGVWR["${SURGE_ENV}"]}|g" devops/codedeploy/environment/deploy-environment.ps1
+sed -i "s|{VAULT_APPROLE_AUTH_PATH}|${VAULT_APPROLE_AUTH_PATH}|g" devops/codedeploy/environment/deploy-environment.ps1
 
-$DatadogTarget = "C:\ProgramData\Datadog\conf.d\etarweb_sbx.d"
+sed -i "s|{SURGE_ENVNAME}|${surgeEnv["SURGE_ENVNAME"]}|g" devops/codedeploy/environment/deploy-environment.ps1
+sed -i "s|{SURGE_RPM_ROOT}|${surgeEnv["SURGE_RPM_ROOT"]}|g" devops/codedeploy/environment/deploy-environment.ps1
 
-if (-Not (Test-Path $DatadogTarget)) {
-    New-Item -ItemType Directory -Path $DatadogTarget | Out-Null
-}
-
-xcopy /s /y /e "$StagingDir\serverconfig\datadog\conf.d\etarweb_sbx.d\*" "$DatadogTarget\"
-
-
+sed -i "s|{DEPLOY_ENVIRONMENT}|${env_DEPLOY_ENVIRONMENT}|g" devops/codedeploy/after-install.bat
