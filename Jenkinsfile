@@ -183,6 +183,27 @@ if ($workers) {
 }
 
 # ---------------------------------------------------------------------------
+# Unlock environmentVariables collection in applicationHost.config
+# Required on Windows Server 2025 / IIS 10 before ServerManager can write
+# environment variables to an app pool. Safe to run on every deployment.
+# ---------------------------------------------------------------------------
+
+Write-Host "--- Unlocking environmentVariables configuration section ---"
+
+try {
+    Set-WebConfiguration `
+        -Filter "system.applicationHost/applicationPools" `
+        -PSPath "MACHINE/WEBROOT" `
+        -Metadata overrideMode `
+        -Value Allow
+    Write-Host "Configuration section unlocked successfully"
+}
+catch {
+    Write-Error "Failed to unlock configuration section: $_"
+    Exit 1
+}
+
+# ---------------------------------------------------------------------------
 # Build the environment variable hashtable
 # ---------------------------------------------------------------------------
 
@@ -202,9 +223,8 @@ $envVars = @{
 
 # ---------------------------------------------------------------------------
 # Apply environment variables via Microsoft.Web.Administration API
-# - DLL loaded by explicit path (not GAC) - required on Windows Server 2025
+# - DLL loaded by explicit path - required on Windows Server 2025
 # - ServerManager constructed with explicit applicationHost.config path
-#   to ensure correct config file is read on this server
 # ---------------------------------------------------------------------------
 
 Write-Host "--- Applying environment variables via Microsoft.Web.Administration API ---"
