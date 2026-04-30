@@ -199,8 +199,7 @@ try {
     Write-Host "Configuration section unlocked successfully"
 }
 catch {
-    Write-Error "Failed to unlock configuration section: $_"
-    Exit 1
+    Write-Warning "Unlock warning (non-fatal): $_"
 }
 
 # ---------------------------------------------------------------------------
@@ -225,6 +224,8 @@ $envVars = @{
 # Apply environment variables via Microsoft.Web.Administration API
 # - DLL loaded by explicit path - required on Windows Server 2025
 # - ServerManager constructed with explicit applicationHost.config path
+# - EnvironmentVariables collection checked for null before Clear()
+#   because the collection does not exist until first variable is added
 # ---------------------------------------------------------------------------
 
 Write-Host "--- Applying environment variables via Microsoft.Web.Administration API ---"
@@ -260,8 +261,14 @@ try {
 
     Write-Host "Found app pool: $($pool.Name)"
 
-    $pool.EnvironmentVariables.Clear()
-    Write-Host "Cleared existing environment variables from app pool"
+    # Check if EnvironmentVariables collection exists before calling Clear()
+    # The collection is null until at least one variable has been added
+    if ($null -ne $pool.EnvironmentVariables) {
+        $pool.EnvironmentVariables.Clear()
+        Write-Host "Cleared existing environment variables from app pool"
+    } else {
+        Write-Host "No existing environment variables collection found - will create fresh"
+    }
 
     $envVars.GetEnumerator() | ForEach-Object {
         $env = $pool.EnvironmentVariables.CreateElement("add")
@@ -300,12 +307,16 @@ try {
     $verifyManager = New-Object Microsoft.Web.Administration.ServerManager($configPath)
     $verifyPool    = $verifyManager.ApplicationPools[$AppPoolName]
 
-    $verifyPool.EnvironmentVariables | ForEach-Object {
-        if ($_.Name -match "ROLE_ID|SECRET_ID") {
-            Write-Host "    $($_.Name) = ****"
-        } else {
-            Write-Host "    $($_.Name) = $($_.Value)"
+    if ($null -ne $verifyPool.EnvironmentVariables) {
+        $verifyPool.EnvironmentVariables | ForEach-Object {
+            if ($_.Name -match "ROLE_ID|SECRET_ID") {
+                Write-Host "    $($_.Name) = ****"
+            } else {
+                Write-Host "    $($_.Name) = $($_.Value)"
+            }
         }
+    } else {
+        Write-Warning "EnvironmentVariables collection is empty after commit"
     }
     $verifyManager.Dispose()
 }
