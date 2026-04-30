@@ -105,12 +105,17 @@ $SurgeEnvName          = "{SURGE_ENVNAME}"
 $SurgeRpmRoot          = "{SURGE_RPM_ROOT}"
 
 # ---------------------------------------------------------------------------
-# IIS site and app pool names - derived from injected environment token
-# Works for both SANDBOX and HOTFIX without hardcoding
+# IIS site and app pool names - hardcoded to match actual IIS configuration
 # ---------------------------------------------------------------------------
 
 $AppPoolName = "Apiservices-SBX"
 $SiteName    = "Apiservices-SBX"
+
+Write-Host "Environment  : $SurgeEnvName"
+Write-Host "IIS Site     : $SiteName"
+Write-Host "App Pool     : $AppPoolName"
+Write-Host "Vault Addr   : $VaultAddress"
+Write-Host "RPM Root     : $SurgeRpmRoot"
 
 # ---------------------------------------------------------------------------
 # Validate IIS module is available before proceeding
@@ -197,32 +202,43 @@ $envVars = @{
 
 # ---------------------------------------------------------------------------
 # Apply environment variables via Microsoft.Web.Administration API
-# Load the DLL directly from the IIS install path instead of GAC
-# Add-Type -AssemblyName does not work on Windows Server 2025 as the
-# assembly is not registered in the Global Assembly Cache (GAC)
+# - DLL loaded by explicit path (not GAC) - required on Windows Server 2025
+# - ServerManager constructed with explicit applicationHost.config path
+#   to ensure correct config file is read on this server
 # ---------------------------------------------------------------------------
 
 Write-Host "--- Applying environment variables via Microsoft.Web.Administration API ---"
 
-$mwaPath = "$env:SystemRoot\system32\inetsrv\Microsoft.Web.Administration.dll"
+$mwaPath    = "$env:SystemRoot\system32\inetsrv\Microsoft.Web.Administration.dll"
+$configPath = "$env:SystemRoot\system32\inetsrv\config\applicationHost.config"
 
 if (-not (Test-Path $mwaPath)) {
     Write-Error "Microsoft.Web.Administration.dll not found at: $mwaPath"
     Exit 1
 }
 
-Write-Host "Loading Microsoft.Web.Administration.dll from: $mwaPath"
+if (-not (Test-Path $configPath)) {
+    Write-Error "applicationHost.config not found at: $configPath"
+    Exit 1
+}
+
+Write-Host "Loading DLL from       : $mwaPath"
+Write-Host "Using config file from : $configPath"
 
 try {
     Add-Type -Path $mwaPath
 
-    $serverManager = New-Object Microsoft.Web.Administration.ServerManager
+    $serverManager = New-Object Microsoft.Web.Administration.ServerManager($configPath)
     $pool = $serverManager.ApplicationPools[$AppPoolName]
 
     if ($null -eq $pool) {
-        Write-Error "ServerManager could not find app pool '$AppPoolName'."
+        Write-Error "ServerManager could not find app pool '$AppPoolName' in $configPath"
+        Write-Host "Available app pools:"
+        $serverManager.ApplicationPools | ForEach-Object { Write-Host "    $($_.Name)" }
         Exit 1
     }
+
+    Write-Host "Found app pool: $($pool.Name)"
 
     $pool.EnvironmentVariables.Clear()
     Write-Host "Cleared existing environment variables from app pool"
@@ -261,7 +277,7 @@ finally {
 Write-Host "--- Verifying environment variables written to app pool ---"
 
 try {
-    $verifyManager = New-Object Microsoft.Web.Administration.ServerManager
+    $verifyManager = New-Object Microsoft.Web.Administration.ServerManager($configPath)
     $verifyPool    = $verifyManager.ApplicationPools[$AppPoolName]
 
     $verifyPool.EnvironmentVariables | ForEach-Object {
