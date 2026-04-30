@@ -1,318 +1,217 @@
-/*
- =======================================================================================
- This file is being updated constantly by the DevOps team to introduce new enhancements
- based on the template.  If you have suggestions for improvement,
- please contact the DevOps team so that we can incorporate the changes into the
- template.  In the meantime, if you have made changes here or don't want this file to be
- updated, please indicate so at the beginning of this file.
- =======================================================================================
- */
-
-def branch = env.BRANCH_NAME ?: "sandbox00"
-def workingDir = "/home/jenkins/agent"
-
-def VAULT_SECRET_PATH = [
-  "DEV":"kv-dev/data/us-west/dev-tar/tar-surgenet-service-secrets",
-  "SIT":"kv-tst/data/us-west/sit-tar/tar-surgenet-service-secrets"
-]
-
-def VAULT_SECRET_PATH_LTAR = [
-  "DEV":"kv-dev/data/us-west/dev-tar/tar-ltar-service-secrets",
-  "SIT":"kv-tst/data/us-west/sit-tar/tar-ltar-service-secrets"
-]
-
-def VAULT_SECRET_PATH_IMGVWR = [
-  "DEV":"kv-dev/data/us-west/dev-tar/tar-image-viewer-service-secrets",
-  "SIT":"kv-tst/data/us-west/sit-tar/tar-image-viewer-service-secrets"
-]
-
-def SURGE_ENV_CONFIG = [
-  "DEV": ["SURGE_ENVNAME": "SANDBOX", "SURGE_RPM_ROOT": "E:/inetpub/ApiServices/RPM/dhcs_dev/rpm_root"],
-  "SIT": ["SURGE_ENVNAME": "HOTFIX",  "SURGE_RPM_ROOT": "E:/inetpub/ApiServices/RPM/dhcs_sit/rpm_root"]
-]
-
-def SURGE_ENV
-
-def VAULT_ADDR = [
-  "DEV":"https://np.secrets.cammis.medi-cal.ca.gov/v1/",
-  "SIT":"https://np.secrets.cammis.medi-cal.ca.gov/v1/"
-]
-
-def VAULT_APPROLE_AUTH_PATH = "auth/approle/login"
+$VaultAddress           = "{VAULT_ADDR}"
+$VaultAppRoleRoleId     = "{APPROLE_ROLE_ID}"
+$VaultAppRoleSecretId   = "{APPROLE_SECRET_ID}"
+$VaultSecretPath        = "{VAULT_SECRET_PATH}"
+$VaultSecretPathLtar    = "{VAULT_SECRET_PATH_LTAR}"
+$VaultSecretPathImgVwr  = "{VAULT_SECRET_PATH_IMGVWR}"
+$VaultAppRoleAuthPath   = "{VAULT_APPROLE_AUTH_PATH}"
+$SurgeEnvName           = "{SURGE_ENVNAME}"
+$SurgeRpmRoot           = "{SURGE_RPM_ROOT}"
 
 
-pipeline {
-  agent {
-    kubernetes {
-      yaml """
-        apiVersion: v1
-        kind: Pod
-        spec:
-          serviceAccountName: jenkins
-          volumes:
-            - name: dockersock
-              hostPath:
-                path: /var/run/docker.sock
-            - emptyDir: {}
-              name: varlibcontainers
-            - name: jenkins-trusted-ca-bundle
-              configMap:
-                name: jenkins-trusted-ca-bundle
-                defaultMode: 420
-                optional: true
-          containers:
-            - name: jnlp
-              securityContext:
-                privileged: true
-              envFrom:
-                - configMapRef:
-                    name: jenkins-agent-env
-                    optional: true
-              env:
-                - name: GIT_SSL_CAINFO
-                  value: "/etc/pki/tls/certs/ca-bundle.crt"
-              volumeMounts:
-                - name: jenkins-trusted-ca-bundle
-                  mountPath: /etc/pki/tls/certs
-            - name: node
-              image: registry.access.redhat.com/ubi8/nodejs-18:latest
-              tty: true
-              command: ["/bin/bash"]
-              securityContext:
-                privileged: true
-              workingDir: ${workingDir}
-              envFrom:
-                - configMapRef:
-                    name: jenkins-agent-env
-                    optional: true
-              env:
-                - name: HOME
-                  value: ${workingDir}
-                - name: BRANCH
-                  value: ${branch}
-                - name: GIT_SSL_CAINFO
-                  value: "/etc/pki/tls/certs/ca-bundle.crt"
-              volumeMounts:
-                - name: jenkins-trusted-ca-bundle
-                  mountPath: /etc/pki/tls/certs
-            - name: aws-boto3
-              image: 136299550619.dkr.ecr.us-west-2.amazonaws.com/cammisboto3:1.0.1
-              tty: true
-              command: ["/bin/bash"]
-              workingDir: ${workingDir}
-              envFrom:
-                - configMapRef:
-                    name: jenkins-agent-env
-                    optional: true
-              env:
-                - name: HOME
-                  value: ${workingDir}
-                - name: BRANCH
-                  value: ${branch}
-                - name: GIT_SSL_CAINFO
-                  value: "/etc/pki/tls/certs/ca-bundle.crt"
-              volumeMounts:
-                - name: jenkins-trusted-ca-bundle
-                  mountPath: /etc/pki/tls/certs
-      """
+# ------------------------------------------------------------------------------
+# Derived IIS names — built from the injected environment token so this script
+# works correctly for both SANDBOX and HOTFIX without any hardcoding.
+# ------------------------------------------------------------------------------
+
+$AppPoolName = "Apiservices-$SurgeEnvName"
+$SiteName    = "Apiservices-$SurgeEnvName"
+
+Write-Host "============================================================"
+Write-Host "  Environment : $SurgeEnvName"
+Write-Host "  IIS Site    : $SiteName"
+Write-Host "  App Pool    : $AppPoolName"
+Write-Host "  Vault Addr  : $VaultAddress"
+Write-Host "  RPM Root    : $SurgeRpmRoot"
+Write-Host "============================================================"
+
+
+# ------------------------------------------------------------------------------
+# Validate IIS module is available before proceeding
+# ------------------------------------------------------------------------------
+
+if (-not (Get-Module -ListAvailable -Name WebAdministration)) {
+    Write-Error "WebAdministration module not found. Ensure IIS is installed."
+    Exit 1
+}
+Import-Module WebAdministration
+Write-Host "WebAdministration module loaded"
+
+
+# ------------------------------------------------------------------------------
+# Verify the site and app pool exist before attempting to stop them
+# ------------------------------------------------------------------------------
+
+if (-not (Test-Path "IIS:\Sites\$SiteName")) {
+    Write-Error "IIS site '$SiteName' does not exist. Verify IIS configuration."
+    Exit 1
+}
+
+if (-not (Test-Path "IIS:\AppPools\$AppPoolName")) {
+    Write-Error "IIS app pool '$AppPoolName' does not exist. Verify IIS configuration."
+    Exit 1
+}
+
+
+# ------------------------------------------------------------------------------
+# Stop site and app pool
+# ------------------------------------------------------------------------------
+
+Write-Host ""
+Write-Host "--- Stopping IIS site and app pool ---"
+
+Stop-Web-Site($SiteName)
+
+Write-Host "Sleeping 5 seconds after site stop"
+Start-Sleep -Seconds 5
+
+Stop-Web-App-Pool($AppPoolName)
+
+Write-Host "Sleeping 5 seconds after app pool stop"
+Start-Sleep -Seconds 5
+
+Write-Host "App pool state after stop:"
+Get-IISAppPool -Name $AppPoolName | Select-Object Name, State
+
+
+# ------------------------------------------------------------------------------
+# Build the environment variable hashtable
+# ------------------------------------------------------------------------------
+
+$envVars = @{
+    VAULT_ADDRESS              = $VaultAddress
+    VAULT_APPROLE_ROLE_ID      = $VaultAppRoleRoleId
+    VAULT_APPROLE_SECRET_ID    = $VaultAppRoleSecretId
+    VAULT_SECRET_PATH          = $VaultSecretPath
+    VAULT_SECRET_PATH_LTAR     = $VaultSecretPathLtar
+    VAULT_SECRET_PATH_IMGVWR   = $VaultSecretPathImgVwr
+    VAULT_APPROLE_AUTH_PATH    = $VaultAppRoleAuthPath
+    SURGE_ENVNAME              = $SurgeEnvName
+    SURGE_RPM_ROOT             = $SurgeRpmRoot
+    SURGE_RPM_ONLINE_KEY       = "/online"
+    DD_LOGS_ENABLED            = "true"
+}
+
+
+# ------------------------------------------------------------------------------
+# Apply environment variables via Microsoft.Web.Administration API
+# ------------------------------------------------------------------------------
+
+Write-Host ""
+Write-Host "--- Applying environment variables via Microsoft.Web.Administration API ---"
+
+try {
+    Add-Type -AssemblyName "Microsoft.Web.Administration"
+
+    $serverManager = New-Object Microsoft.Web.Administration.ServerManager
+    $pool = $serverManager.ApplicationPools[$AppPoolName]
+
+    if ($null -eq $pool) {
+        Write-Error "ServerManager could not find app pool '$AppPoolName'."
+        Exit 1
     }
-  }
 
-  options {
-    timestamps()
-    disableConcurrentBuilds()
-    timeout(time: 5, unit: 'HOURS')
-    skipDefaultCheckout()
-    buildDiscarder(logRotator(numToKeepStr: '20'))
-  }
+    # Clear existing env vars so stale keys do not persist between deployments
+    $pool.EnvironmentVariables.Clear()
+    Write-Host "Cleared existing environment variables from app pool"
 
-  environment {
-    env_current_git_commit = ""
-    env_accesskey          = ""
-    env_secretkey          = ""
-    env_tag_name           = ""
-    env_deploy_env         = ""
-    env_DEPLOY_ENVIRONMENT = "true"
-    env_DEPLOY_FILES       = "false"
-    env_DEPLOY_CONFIG      = "false"
-  }
+    $envVars.GetEnumerator() | ForEach-Object {
+        $env = $pool.EnvironmentVariables.CreateElement("add")
+        $env.Attributes["name"].Value  = $_.Key
+        $env.Attributes["value"].Value = $_.Value
+        $pool.EnvironmentVariables.Add($env)
 
-  stages {
-
-    // -------------------------------------------------------------------------
-    stage("Initialize") {
-    // -------------------------------------------------------------------------
-      steps {
-        container(name: "node") {
-          script {
-
-            properties([
-              parameters([
-                choice(
-                  name: 'DEPLOY_ENV',
-                  choices: ['NONE', 'SANDBOX', 'HOTFIX'],
-                  description: 'Deployment Environment'
-                )
-              ])
-            ])
-
-            def ENV_ALIAS_MAP = [
-              "SANDBOX": "DEV",
-              "HOTFIX":  "SIT"
-            ]
-
-            if (params.DEPLOY_ENV == "NONE") {
-              SURGE_ENV = "NONE"
-            } else {
-              SURGE_ENV = ENV_ALIAS_MAP[params.DEPLOY_ENV]
-            }
-
-            deleteDir()
-
-            checkout(scm)
-
-            echo "Current deployment environment is ${SURGE_ENV}"
-
-          } //END script
-        } //END container node
-      } //END steps
-    } //END stage Initialize
-
-
-    // -------------------------------------------------------------------------
-    stage('Prepare Deployment') {
-    // -------------------------------------------------------------------------
-      when {
-        expression { SURGE_ENV != "NONE" }
-      }
-      steps {
-        container(name: "aws-boto3") {
-          script {
-
-            def surgeEnv = SURGE_ENV_CONFIG[SURGE_ENV]
-
-            sh """#!/bin/bash
-              echo "Setting up app directories — deployment will fail without these"
-              mkdir -p devops/codedeploy/surgeapi
-              touch devops/codedeploy/surgeapi/placeholder.txt
-
-              echo "Replacing tokenized values in deploy-environment.ps1"
-              sed -i "s,{VAULT_ADDR},${VAULT_ADDR[SURGE_ENV]}," devops/codedeploy/environment/deploy-environment.ps1
-              sed -i "s,{VAULT_SECRET_PATH},${VAULT_SECRET_PATH[SURGE_ENV]}," devops/codedeploy/environment/deploy-environment.ps1
-              sed -i "s,{VAULT_SECRET_PATH_LTAR},${VAULT_SECRET_PATH_LTAR[SURGE_ENV]}," devops/codedeploy/environment/deploy-environment.ps1
-              sed -i "s,{VAULT_SECRET_PATH_IMGVWR},${VAULT_SECRET_PATH_IMGVWR[SURGE_ENV]}," devops/codedeploy/environment/deploy-environment.ps1
-              sed -i "s,{VAULT_APPROLE_AUTH_PATH},${VAULT_APPROLE_AUTH_PATH}," devops/codedeploy/environment/deploy-environment.ps1
-              sed -i "s,{SURGE_RPM_ROOT},${surgeEnv['SURGE_RPM_ROOT']}," devops/codedeploy/environment/deploy-environment.ps1
-              sed -i "s,{SURGE_ENVNAME},${surgeEnv['SURGE_ENVNAME']}," devops/codedeploy/environment/deploy-environment.ps1
-
-              echo "Replacing tokenized values in after-install.bat"
-              sed -i "s,{DEPLOY_ENVIRONMENT},${env_DEPLOY_ENVIRONMENT}," devops/codedeploy/after-install.bat
-            """
-
-            withCredentials([string(credentialsId: 'APPROLE_ROLE_ID', variable: 'APPROLE_ROLE_ID')]) {
-              sh """#!/bin/bash
-                sed -i "s,{APPROLE_ROLE_ID},${APPROLE_ROLE_ID}," devops/codedeploy/environment/deploy-environment.ps1
-              """
-            }
-
-            withCredentials([string(credentialsId: 'APPROLE_SECRET_ID', variable: 'APPROLE_SECRET_ID')]) {
-              sh """#!/bin/bash
-                sed -i "s,{APPROLE_SECRET_ID},${APPROLE_SECRET_ID}," devops/codedeploy/environment/deploy-environment.ps1
-              """
-            }
-
-            echo "Prepare Deployment complete for environment: ${surgeEnv['SURGE_ENVNAME']}"
-
-          } //END script
-        } //END container aws-boto3
-      } //END steps
-    } //END stage Prepare Deployment
-
-
-    // -------------------------------------------------------------------------
-    stage('Deploy') {
-    // -------------------------------------------------------------------------
-      when {
-        expression { SURGE_ENV != "NONE" }
-      }
-      steps {
-        container(name: "aws-boto3") {
-          script {
-
-            echo "Deploying to Non-DR (us-west-2)"
-            withCredentials([aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'jenkins-ecr', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
-              step([$class: 'AWSCodeDeployPublisher',
-                applicationName:     "tar-surge-app-${SURGE_ENV}",
-                awsAccessKey:        "${AWS_ACCESS_KEY_ID}",
-                awsSecretKey:        "${AWS_SECRET_ACCESS_KEY}",
-                credentials:         'awsAccessKey',
-                deploymentConfig:    "tar-surge-app-${SURGE_ENV}-config",
-                deploymentGroupAppspec: false,
-                deploymentGroupName: "tar-surge-app-${SURGE_ENV}-INPLACE-deployment-group",
-                deploymentMethod:    'deploy',
-                excludes: '', iamRoleArn: '', includes: '**',
-                pollingFreqSec: 15, pollingTimeoutSec: 900,
-                proxyHost: '', proxyPort: 0,
-                region: 'us-west-2',
-                s3bucket: 'dhcs-codedeploy-app',
-                subdirectory: 'devops/codedeploy',
-                versionFileName: '',
-                waitForCompletion: true
-              ])
-            }
-
-            if (SURGE_ENV != "DEV") {
-              echo "Deploying to DR (us-east-1)"
-              withCredentials([aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'jenkins-ecr', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
-                step([$class: 'AWSCodeDeployPublisher',
-                  applicationName:     "tar-surge-app-${SURGE_ENV}-DR",
-                  awsAccessKey:        "${AWS_ACCESS_KEY_ID}",
-                  awsSecretKey:        "${AWS_SECRET_ACCESS_KEY}",
-                  credentials:         'awsAccessKey',
-                  deploymentConfig:    "tar-surge-app-${SURGE_ENV}-DR-config",
-                  deploymentGroupAppspec: false,
-                  deploymentGroupName: "tar-surge-app-${SURGE_ENV}-DR-INPLACE-deployment-group",
-                  deploymentMethod:    'deploy',
-                  excludes: '', iamRoleArn: '', includes: '**',
-                  pollingFreqSec: 15, pollingTimeoutSec: 900,
-                  proxyHost: '', proxyPort: 0,
-                  region: 'us-east-1',
-                  s3bucket: 'dhcs-codedeploy-app-dr',
-                  subdirectory: 'devops/codedeploy',
-                  versionFileName: '',
-                  waitForCompletion: true
-                ])
-              }
-            }
-
-          } //END script
-        } //END container aws-boto3
-      } //END steps
-    } //END stage Deploy
-
-  } //END stages
-
-  // ---------------------------------------------------------------------------
-  post {
-  // ---------------------------------------------------------------------------
-    always {
-      echo "Build process complete."
+        if ($_.Key -match "ROLE_ID|SECRET_ID") {
+            Write-Host "    Set: $($_.Key) = ****"
+        } else {
+            Write-Host "    Set: $($_.Key) = $($_.Value)"
+        }
     }
-    success {
-      echo "Build process was successful."
-    }
-    unstable {
-      echo "Build is unstable."
-    }
-    aborted {
-      echo "Pipeline aborted."
-    }
-    failure {
-      echo "Build encountered failures."
-    }
-    changed {
-      echo "Build result changed from previous run."
-    }
-  } //END post
 
-} //END pipeline
+    $serverManager.CommitChanges()
+    Write-Host "Environment variables committed via ServerManager API"
+}
+catch {
+    Write-Error "Failed to apply environment variables via ServerManager API: $_"
+    Exit 1
+}
+finally {
+    if ($null -ne $serverManager) {
+        $serverManager.Dispose()
+        Write-Host "ServerManager disposed"
+    }
+}
+
+
+# ------------------------------------------------------------------------------
+# Verify env vars were written correctly by reading back from IIS
+# ------------------------------------------------------------------------------
+
+Write-Host ""
+Write-Host "--- Verifying environment variables written to app pool ---"
+
+try {
+    $verifyManager = New-Object Microsoft.Web.Administration.ServerManager
+    $verifyPool    = $verifyManager.ApplicationPools[$AppPoolName]
+
+    $verifyPool.EnvironmentVariables | ForEach-Object {
+        if ($_.Name -match "ROLE_ID|SECRET_ID") {
+            Write-Host "    $($_.Name) = ****"
+        } else {
+            Write-Host "    $($_.Name) = $($_.Value)"
+        }
+    }
+    $verifyManager.Dispose()
+}
+catch {
+    Write-Warning "Could not read back environment variables for verification: $_"
+}
+
+
+# ------------------------------------------------------------------------------
+# Start app pool and site
+# ------------------------------------------------------------------------------
+
+Write-Host ""
+Write-Host "--- Starting IIS app pool and site ---"
+
+Start-Web-App-Pool($AppPoolName)
+
+Write-Host "Sleeping 5 seconds after app pool start"
+Start-Sleep -Seconds 5
+
+Write-Host "App pool state after start:"
+Get-IISAppPool -Name $AppPoolName | Select-Object Name, State
+
+Start-Web-Site($SiteName)
+
+Write-Host "Sleeping 5 seconds after site start"
+Start-Sleep -Seconds 5
+
+Write-Host "Site state after start:"
+Get-WebsiteState -Name $SiteName
+
+
+# ------------------------------------------------------------------------------
+# Final health check — confirm site and pool are both running
+# ------------------------------------------------------------------------------
+
+Write-Host ""
+Write-Host "--- Final status check ---"
+
+$poolState = (Get-WebAppPoolState -Name $AppPoolName).Value
+$siteState = (Get-WebsiteState    -Name $SiteName).Value
+
+Write-Host "App pool '$AppPoolName' : $poolState"
+Write-Host "Site      '$SiteName'   : $siteState"
+
+if ($poolState -ne "Started" -or $siteState -ne "Started") {
+    Write-Error "Deployment incomplete — site or app pool did not reach Started state."
+    Exit 1
+}
+
+Write-Host ""
+Write-Host "============================================================"
+Write-Host "  Environment Deploy Complete -- $SurgeEnvName"
+Write-Host "============================================================"
+Exit 0
