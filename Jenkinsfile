@@ -112,11 +112,6 @@ $SurgeRpmRoot          = "{SURGE_RPM_ROOT}"
 $AppPoolName = "Apiservices-SBX"
 $SiteName    = "Apiservices-SBX"
 
-Write-Host "Environment  : $SurgeEnvName"
-Write-Host "IIS Site     : $SiteName"
-Write-Host "App Pool     : $AppPoolName"
-Write-Host "Vault Addr   : $VaultAddress"
-Write-Host "RPM Root     : $SurgeRpmRoot"
 
 # ---------------------------------------------------------------------------
 # Validate IIS module is available before proceeding
@@ -161,6 +156,27 @@ Start-Sleep -Seconds 5
 
 Write-Host "App pool state after stop:"
 Get-IISAppPool -Name $AppPoolName | Select-Object Name, State
+
+# ---------------------------------------------------------------------------
+# Kill any lingering w3wp.exe worker processes
+# w3wp.exe can keep applicationHost.config locked even after the pool shows
+# as Stopped, causing ServerManager to hang indefinitely.
+# ---------------------------------------------------------------------------
+
+Write-Host "--- Checking for lingering w3wp.exe worker processes ---"
+
+$workers = Get-Process -Name "w3wp" -ErrorAction SilentlyContinue
+if ($workers) {
+    $workers | ForEach-Object {
+        Write-Host "Killing w3wp.exe PID: $($_.Id)"
+        Stop-Process -Id $_.Id -Force
+    }
+    Write-Host "Sleeping 3 seconds after killing worker processes"
+    Start-Sleep -Seconds 3
+    Write-Host "Worker processes cleared"
+} else {
+    Write-Host "No lingering w3wp.exe processes found"
+}
 
 # ---------------------------------------------------------------------------
 # Build the environment variable hashtable
@@ -272,5 +288,5 @@ Start-Sleep -Seconds 5
 Write-Host "Site state after start:"
 Get-WebsiteState -Name $SiteName
 
-Write-Host "Environment Deploy Complete"
+Write-Host "Environment Deploy Complete - $SurgeEnvName"
 Exit 0
