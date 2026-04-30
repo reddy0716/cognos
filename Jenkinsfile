@@ -112,7 +112,6 @@ $SurgeRpmRoot          = "{SURGE_RPM_ROOT}"
 $AppPoolName = "Apiservices-SBX"
 $SiteName    = "Apiservices-SBX"
 
-
 # ---------------------------------------------------------------------------
 # Validate IIS module is available before proceeding
 # ---------------------------------------------------------------------------
@@ -198,12 +197,24 @@ $envVars = @{
 
 # ---------------------------------------------------------------------------
 # Apply environment variables via Microsoft.Web.Administration API
+# Load the DLL directly from the IIS install path instead of GAC
+# Add-Type -AssemblyName does not work on Windows Server 2025 as the
+# assembly is not registered in the Global Assembly Cache (GAC)
 # ---------------------------------------------------------------------------
 
 Write-Host "--- Applying environment variables via Microsoft.Web.Administration API ---"
 
+$mwaPath = "$env:SystemRoot\system32\inetsrv\Microsoft.Web.Administration.dll"
+
+if (-not (Test-Path $mwaPath)) {
+    Write-Error "Microsoft.Web.Administration.dll not found at: $mwaPath"
+    Exit 1
+}
+
+Write-Host "Loading Microsoft.Web.Administration.dll from: $mwaPath"
+
 try {
-    Add-Type -AssemblyName "Microsoft.Web.Administration"
+    Add-Type -Path $mwaPath
 
     $serverManager = New-Object Microsoft.Web.Administration.ServerManager
     $pool = $serverManager.ApplicationPools[$AppPoolName]
@@ -287,6 +298,23 @@ Start-Sleep -Seconds 5
 
 Write-Host "Site state after start:"
 Get-WebsiteState -Name $SiteName
+
+# ---------------------------------------------------------------------------
+# Final health check
+# ---------------------------------------------------------------------------
+
+Write-Host "--- Final status check ---"
+
+$poolState = (Get-WebAppPoolState -Name $AppPoolName).Value
+$siteState = (Get-WebsiteState    -Name $SiteName).Value
+
+Write-Host "App pool '$AppPoolName' : $poolState"
+Write-Host "Site     '$SiteName'    : $siteState"
+
+if ($poolState -ne "Started" -or $siteState -ne "Started") {
+    Write-Error "Deployment incomplete - site or app pool did not reach Started state."
+    Exit 1
+}
 
 Write-Host "Environment Deploy Complete - $SurgeEnvName"
 Exit 0
