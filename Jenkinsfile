@@ -75,17 +75,12 @@ if ($PSHOME -like "*SysWOW64*")
 {
     Write-Warning "Restarting this script under 64-bit Windows PowerShell."
 
-    # Restart this script under 64-bit Windows PowerShell.
-    #   (\SysNative\ redirects to \System32\ for 64-bit mode)
-
     & (Join-Path ($PSHOME -replace "SysWOW64", "SysNative") powershell.exe) -File `
         (Join-Path $PSScriptRoot $MyInvocation.MyCommand) @args
 
-    # Exit 32-bit script.
     Exit $LastExitCode
 }
 
-# Was restart successful?
 Write-Warning "Hello from $PSHOME"
 Write-Warning "  (\SysWOW64\ = 32-bit mode, \System32\ = 64-bit mode)"
 Write-Warning "Original arguments (if any): $args"
@@ -105,11 +100,12 @@ $SurgeEnvName          = "{SURGE_ENVNAME}"
 $SurgeRpmRoot          = "{SURGE_RPM_ROOT}"
 
 # ---------------------------------------------------------------------------
-# IIS site and app pool names - hardcoded to match actual IIS configuration
+# IIS site and app pool names
 # ---------------------------------------------------------------------------
 
 $AppPoolName = "Apiservices-SBX"
 $SiteName    = "Apiservices-SBX"
+$appcmd      = "$env:SystemRoot\system32\inetsrv\appcmd.exe"
 
 Write-Host "Environment  : $SurgeEnvName"
 Write-Host "IIS Site     : $SiteName"
@@ -129,16 +125,26 @@ Import-Module WebAdministration
 Write-Host "WebAdministration module loaded"
 
 # ---------------------------------------------------------------------------
-# Verify the site and app pool exist before attempting to stop them
+# Validate appcmd.exe exists
+# ---------------------------------------------------------------------------
+
+if (-not (Test-Path $appcmd)) {
+    Write-Error "appcmd.exe not found at: $appcmd"
+    Exit 1
+}
+Write-Host "appcmd.exe found at: $appcmd"
+
+# ---------------------------------------------------------------------------
+# Verify the site and app pool exist
 # ---------------------------------------------------------------------------
 
 if (-not (Test-Path "IIS:\Sites\$SiteName")) {
-    Write-Error "IIS site '$SiteName' does not exist. Verify IIS configuration."
+    Write-Error "IIS site '$SiteName' does not exist."
     Exit 1
 }
 
 if (-not (Test-Path "IIS:\AppPools\$AppPoolName")) {
-    Write-Error "IIS app pool '$AppPoolName' does not exist. Verify IIS configuration."
+    Write-Error "IIS app pool '$AppPoolName' does not exist."
     Exit 1
 }
 
@@ -149,12 +155,10 @@ if (-not (Test-Path "IIS:\AppPools\$AppPoolName")) {
 Write-Host "--- Stopping IIS site and app pool ---"
 
 Stop-Web-Site($SiteName)
-
 Write-Host "Sleeping 5 seconds after site stop"
 Start-Sleep -Seconds 5
 
 Stop-Web-App-Pool($AppPoolName)
-
 Write-Host "Sleeping 5 seconds after app pool stop"
 Start-Sleep -Seconds 5
 
@@ -163,8 +167,6 @@ Get-IISAppPool -Name $AppPoolName | Select-Object Name, State
 
 # ---------------------------------------------------------------------------
 # Kill any lingering w3wp.exe worker processes
-# w3wp.exe can keep applicationHost.config locked even after the pool shows
-# as Stopped, causing ServerManager to hang indefinitely.
 # ---------------------------------------------------------------------------
 
 Write-Host "--- Checking for lingering w3wp.exe worker processes ---"
@@ -183,29 +185,22 @@ if ($workers) {
 }
 
 # ---------------------------------------------------------------------------
-# Unlock environmentVariables collection in applicationHost.config
-# Required on Windows Server 2025 / IIS 10 before ServerManager can write
-# environment variables to an app pool. Safe to run on every deployment.
+# Apply environment variables using appcmd.exe
+# This is the most reliable method on IIS 10 / Windows Server 2025.
+# ServerManager was abandoned due to null EnvironmentVariables collection.
+# Steps:
+#   1. Clear all existing env vars on the app pool
+#   2. Add each env var individually
 # ---------------------------------------------------------------------------
 
-Write-Host "--- Unlocking environmentVariables configuration section ---"
+Write-Host "--- Applying environment variables via appcmd.exe ---"
 
-try {
-    Set-WebConfiguration `
-        -Filter "system.applicationHost/applicationPools" `
-        -PSPath "MACHINE/WEBROOT" `
-        -Metadata overrideMode `
-        -Value Allow
-    Write-Host "Configuration section unlocked successfully"
-}
-catch {
-    Write-Warning "Unlock warning (non-fatal): $_"
-}
+# Step 1 - Clear all existing environment variables from the app pool
+Write-Host "Clearing existing environment variables..."
+& $appcmd set apppool "$AppPoolName" /environmentVariables
+Write-Host "Existing environment variables cleared"
 
-# ---------------------------------------------------------------------------
-# Build the environment variable hashtable
-# ---------------------------------------------------------------------------
-
+# Step 2 - Add each environment variable
 $envVars = @{
     VAULT_ADDRESS            = $VaultAddress
     VAULT_APPROLE_ROLE_ID    = $VaultAppRoleRoleId
@@ -220,109 +215,36 @@ $envVars = @{
     DD_LOGS_ENABLED          = "true"
 }
 
-# ---------------------------------------------------------------------------
-# Apply environment variables via Microsoft.Web.Administration API
-# - DLL loaded by explicit path - required on Windows Server 2025
-# - ServerManager constructed with explicit applicationHost.config path
-# - EnvironmentVariables collection checked for null before Clear()
-#   because the collection does not exist until first variable is added
-# ---------------------------------------------------------------------------
+$envVars.GetEnumerator() | ForEach-Object {
+    $name  = $_.Key
+    $value = $_.Value
 
-Write-Host "--- Applying environment variables via Microsoft.Web.Administration API ---"
+    & $appcmd set config `
+        -section:system.applicationHost/applicationPools `
+        /+"[name='$AppPoolName'].environmentVariables.[name='$name',value='$value']" `
+        /commit:apphost
 
-$mwaPath    = "$env:SystemRoot\system32\inetsrv\Microsoft.Web.Administration.dll"
-$configPath = "$env:SystemRoot\system32\inetsrv\config\applicationHost.config"
-
-if (-not (Test-Path $mwaPath)) {
-    Write-Error "Microsoft.Web.Administration.dll not found at: $mwaPath"
-    Exit 1
-}
-
-if (-not (Test-Path $configPath)) {
-    Write-Error "applicationHost.config not found at: $configPath"
-    Exit 1
-}
-
-Write-Host "Loading DLL from       : $mwaPath"
-Write-Host "Using config file from : $configPath"
-
-try {
-    Add-Type -Path $mwaPath
-
-    $serverManager = New-Object Microsoft.Web.Administration.ServerManager($configPath)
-    $pool = $serverManager.ApplicationPools[$AppPoolName]
-
-    if ($null -eq $pool) {
-        Write-Error "ServerManager could not find app pool '$AppPoolName' in $configPath"
-        Write-Host "Available app pools:"
-        $serverManager.ApplicationPools | ForEach-Object { Write-Host "    $($_.Name)" }
+    if ($LASTEXITCODE -eq 0) {
+        if ($name -match "ROLE_ID|SECRET_ID") {
+            Write-Host "    Set: $name = ****"
+        } else {
+            Write-Host "    Set: $name = $value"
+        }
+    } else {
+        Write-Error "Failed to set environment variable: $name (exit code $LASTEXITCODE)"
         Exit 1
     }
-
-    Write-Host "Found app pool: $($pool.Name)"
-
-    # Check if EnvironmentVariables collection exists before calling Clear()
-    # The collection is null until at least one variable has been added
-    if ($null -ne $pool.EnvironmentVariables) {
-        $pool.EnvironmentVariables.Clear()
-        Write-Host "Cleared existing environment variables from app pool"
-    } else {
-        Write-Host "No existing environment variables collection found - will create fresh"
-    }
-
-    $envVars.GetEnumerator() | ForEach-Object {
-        $env = $pool.EnvironmentVariables.CreateElement("add")
-        $env.Attributes["name"].Value  = $_.Key
-        $env.Attributes["value"].Value = $_.Value
-        $pool.EnvironmentVariables.Add($env)
-
-        if ($_.Key -match "ROLE_ID|SECRET_ID") {
-            Write-Host "    Set: $($_.Key) = ****"
-        } else {
-            Write-Host "    Set: $($_.Key) = $($_.Value)"
-        }
-    }
-
-    $serverManager.CommitChanges()
-    Write-Host "Environment variables committed via ServerManager API"
 }
-catch {
-    Write-Error "Failed to apply environment variables via ServerManager API: $_"
-    Exit 1
-}
-finally {
-    if ($null -ne $serverManager) {
-        $serverManager.Dispose()
-        Write-Host "ServerManager disposed"
-    }
-}
+
+Write-Host "All environment variables applied via appcmd.exe"
 
 # ---------------------------------------------------------------------------
-# Verify env vars were written correctly by reading back from IIS
+# Verify env vars were written - read back via appcmd.exe
 # ---------------------------------------------------------------------------
 
-Write-Host "--- Verifying environment variables written to app pool ---"
-
-try {
-    $verifyManager = New-Object Microsoft.Web.Administration.ServerManager($configPath)
-    $verifyPool    = $verifyManager.ApplicationPools[$AppPoolName]
-
-    if ($null -ne $verifyPool.EnvironmentVariables) {
-        $verifyPool.EnvironmentVariables | ForEach-Object {
-            if ($_.Name -match "ROLE_ID|SECRET_ID") {
-                Write-Host "    $($_.Name) = ****"
-            } else {
-                Write-Host "    $($_.Name) = $($_.Value)"
-            }
-        }
-    } else {
-        Write-Warning "EnvironmentVariables collection is empty after commit"
-    }
-    $verifyManager.Dispose()
-}
-catch {
-    Write-Warning "Could not read back environment variables for verification: $_"
-}
+Write-Host "--- Verifying environment variables ---"
+& $appcmd list config -section:system.applicationHost/applicationPools `
+    /xml | Select-String -Pattern "environmentVariable|$AppPoolName"
 
 # ---------------------------------------------------------------------------
 # Start app pool and site
@@ -331,7 +253,6 @@ catch {
 Write-Host "--- Starting IIS app pool and site ---"
 
 Start-Web-App-Pool($AppPoolName)
-
 Write-Host "Sleeping 5 seconds after app pool start"
 Start-Sleep -Seconds 5
 
@@ -339,7 +260,6 @@ Write-Host "App pool state after start:"
 Get-IISAppPool -Name $AppPoolName | Select-Object Name, State
 
 Start-Web-Site($SiteName)
-
 Write-Host "Sleeping 5 seconds after site start"
 Start-Sleep -Seconds 5
 
