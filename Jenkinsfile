@@ -1,30 +1,36 @@
-# --------------------------------------------------------------------
-# Fetch MotioCI Projects & Folders for Dynamic Parameters
-# --------------------------------------------------------------------
-echo "Fetching available projects for ${SOURCE_ENV}..."
-python3 ci-cli.py --server="$MOTIO_SERVER" \
-  project ls --xauthtoken "$TOKEN" \
-  --instanceName "${SOURCE_ENV}" > ../projects_raw.json
+Subject: Sandbox & Hotfix Environment Setup on Dev/SIT Servers – Summary
 
-# Extract project names and save to workspace
-grep -o "'name': '[^']*'" ../projects_raw.json | cut -d"'" -f4 | sort | uniq > ../../projects.txt || true
-echo "Saved project list to: $WORKSPACE/projects.txt"
-head -n 10 ../../projects.txt || echo "(No projects found)"
+Hi [Manager's Name],
 
-# If user already selected a project, fetch its folders
-if [ -n "${PROJECT_NAME:-}" ]; then
-  echo "Fetching folders for project: ${PROJECT_NAME}"
-  python3 ci-cli.py --server="$MOTIO_SERVER" \
-    versionedItems ls --xauthtoken "$TOKEN" \
-    --instanceName "${SOURCE_ENV}" \
-    --projectName "${PROJECT_NAME}" --currentOnly True > ../folders_raw.json || true
+As requested, here's a summary of the work completed to stand up the Sandbox and Hotfix environments alongside our existing Dev and SIT environments on the same servers.
 
-  grep "prettyPath" ../folders_raw.json | cut -d"'" -f4 | sort | uniq > ../../folders.txt || true
-  echo "Saved folder list to: $WORKSPACE/folders.txt"
-  head -n 10 ../../folders.txt || echo "(No folders found)"
-else
-  echo "Skipping folder discovery — PROJECT_NAME not provided yet."
-fi
+**Objective**
+Set up Sandbox and Hotfix environments co-located on the same servers as Dev and SIT, without disrupting existing Dev/SIT functionality.
 
-# Double-check both files exist
-ls -lh ../../projects.txt ../../folders.txt || true
+**Artifact Storage**
+- Created a separate folder on the IIS server's E drive to hold all Sandbox and Hotfix artifacts, keeping them cleanly separated from the existing D drive used by Dev and SIT.
+
+**IIS Configuration (Sites & App Pools)**
+- No config-level dependencies were involved — the main change was updating paths and creating new IIS sites and app pools with distinct names for Sandbox and Hotfix, so they run independently from Dev and SIT on the same server.
+
+**Environment Variables**
+- Dev and SIT currently have env variables set at the machine level, which creates a dependency/conflict risk for any new environment added to the same box.
+- To avoid this, Sandbox and Hotfix env variables were configured at the app pool level instead. This isolates each environment's variables to its own app pool without touching or affecting the machine-level settings used by Dev/SIT.
+
+**Build & Deployment Pipeline**
+- Application build process mirrors Dev/SIT.
+- Sandbox: a new branch (sandbox00) triggers the build, and artifacts are automatically deployed to the Sandbox path on the IIS server's E drive.
+- Hotfix: uses a promotion pipeline that promotes everything from Sandbox to Hotfix — config, env variables, artifacts, sites, and app pools — following the same pattern as Sandbox.
+
+**Testing Status**
+- Sandbox has been tested end-to-end and is working as expected.
+- Hotfix is built the same way and is expected to behave identically; final validation is [in progress / pending — let me know which applies].
+
+You're welcome to verify this setup directly on the Dev and SIT servers — everything is live and configured as described above.
+
+Branch reference: [insert Git branch name/link here]
+
+Happy to walk through any part of this in more detail.
+
+Thanks,
+[Your Name]
